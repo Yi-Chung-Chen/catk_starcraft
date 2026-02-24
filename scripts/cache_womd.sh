@@ -11,5 +11,5 @@ python \
   -m src.data_preprocess \
   --split $DATA_SPLIT \
   --num_workers 12 \
-  --input_dir /scratch/data/womd/uncompressed/scenario \
-  --output_dir /scratch/cache/SMART
+  --input_dir data/waymo/scenario \
+  --output_dir data/waymo_processed
