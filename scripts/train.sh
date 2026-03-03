@@ -7,11 +7,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 MY_EXPERIMENT="pre_bc"
 MY_TASK_NAME=$MY_EXPERIMENT"-debug"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
-torchrun \
+# source ~/miniconda3/etc/profile.d/conda.sh
+# conda activate catk
+torchrun --nproc_per_node=gpu \
   -m src.run \
   experiment=$MY_EXPERIMENT \
+  model=smart_nano_1M \
   task_name=$MY_TASK_NAME
 
 # ! below is for training with ddp
@@ -24,6 +25,7 @@ torchrun \
 #   -m src.run \
 #   experiment=$MY_EXPERIMENT \
 #   trainer=ddp \
+#   model=smart_nano_1M \
 #   task_name=$MY_TASK_NAME
 
 echo "bash train.sh done!"
