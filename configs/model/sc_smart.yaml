@@ -1,0 +1,40 @@
+_target_: src.starcraft.model.sc_smart.SCSMART
+model_config:
+  lr: 0.0005
+  lr_warmup_steps: 0
+  lr_total_steps: ${trainer.max_epochs}
+  lr_min_ratio: 0.05
+  n_rollout_closed_val: 32
+  val_open_loop: true
+  val_closed_loop: false
+  token_processor:
+    motion_dict_file: ${paths.sc_motion_dict}
+    agent_token_sampling:
+      num_k: 1
+      temp: 1.0
+  validation_rollout_sampling:
+    criterium: topk_prob
+    num_k: 5
+    temp: 1.0
+  training_rollout_sampling:
+    criterium: topk_prob
+    num_k: -1
+    temp: 1.0
+  decoder:
+    hidden_dim: 128
+    num_freq_bands: 64
+    num_heads: 8
+    head_dim: 16
+    dropout: 0.1
+    hist_drop_prob: 0.1
+    num_agent_layers: 6
+    a2a_radius: 30
+    time_span: 30
+    num_historical_steps: 17
+    num_future_steps: 128
+  training_loss:
+    use_gt_raw: true
+    gt_thresh_scale_length: -1.0
+    label_smoothing: 0.1
+    rollout_as_gt: false
+  finetune: false
