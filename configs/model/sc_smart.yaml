@@ -5,6 +5,9 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
   n_rollout_closed_val: 32
+  n_vis_batch: 0
+  n_vis_scenario: 2
+  n_vis_rollout: 1
   val_open_loop: true
   val_closed_loop: false
   token_processor:

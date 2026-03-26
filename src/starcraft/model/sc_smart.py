@@ -1,7 +1,9 @@
 """StarCraft SMART model (LightningModule)."""
 
 import math
+from pathlib import Path
 
+import hydra
 import torch
 from lightning import LightningModule
 from torch.optim.lr_scheduler import LambdaLR
@@ -10,6 +12,7 @@ from src.smart.metrics import TokenCls, minADE
 from src.starcraft.metrics.sc_cross_entropy import SCCrossEntropy
 from src.starcraft.modules.sc_decoder import SCDecoder
 from src.starcraft.tokens.sc_token_processor import SCTokenProcessor
+from src.starcraft.utils.vis_starcraft import extract_scenario_data, save_scenario_gif
 from src.smart.utils.finetune import set_model_for_finetuning
 
 
@@ -39,6 +42,15 @@ class SCSMART(LightningModule):
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+
+        self.n_vis_batch = model_config.n_vis_batch
+        self.n_vis_scenario = model_config.n_vis_scenario
+        self.n_vis_rollout = model_config.n_vis_rollout
+
+        self.gif_dir = (
+            Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
+            / "gifs"
+        )
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -97,6 +109,27 @@ class SCSMART(LightningModule):
                 target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
             )
             self.log("val_closed/ADE", self.minADE, on_epoch=True, sync_dist=True, batch_size=1)
+
+            if self.global_rank == 0 and batch_idx < self.n_vis_batch:
+                n_scenarios = min(self.n_vis_scenario, data.num_graphs)
+                n_rollouts_vis = min(self.n_vis_rollout, pred_traj.shape[1])
+                for i_sc in range(n_scenarios):
+                    for i_roll in range(n_rollouts_vis):
+                        sc_data = extract_scenario_data(
+                            data, pred_traj, i_sc, i_roll,
+                        )
+                        save_dir = (
+                            self.gif_dir
+                            / f"batch_{batch_idx:02d}"
+                            / f"scenario_{i_sc:02d}"
+                        )
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        gif_path = save_dir / f"rollout_{i_roll:02d}.gif"
+                        save_scenario_gif(
+                            **sc_data,
+                            save_path=str(gif_path),
+                            num_historical_steps=self.num_historical_steps,
+                        )
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
