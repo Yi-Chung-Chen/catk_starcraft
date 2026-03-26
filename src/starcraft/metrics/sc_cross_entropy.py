@@ -1,4 +1,4 @@
-"""StarCraft cross-entropy loss with center-based token matching."""
+"""StarCraft cross-entropy loss with contour-based token matching."""
 
 from typing import Optional
 
@@ -8,6 +8,7 @@ from torch.nn.functional import cross_entropy, one_hot
 from torchmetrics.metric import Metric
 
 from src.smart.metrics.utils import get_euclidean_targets
+from src.smart.utils import cal_polygon_contour
 
 
 class SCCrossEntropy(Metric):
@@ -45,7 +46,7 @@ class SCCrossEntropy(Metric):
         gt_head: Tensor,  # [n_agent, 18]
         gt_valid: Tensor,  # [n_agent, 18]
         token_agent_shape: Tensor,  # [n_agent, 2]
-        token_traj: Tensor,  # [n_token, 3] (endpoint: rel_x, rel_y, rel_heading)
+        token_traj: Tensor,  # [n_token, 4, 2]
         train_mask: Optional[Tensor] = None,
         next_token_action: Optional[Tensor] = None,
         **kwargs,
@@ -67,9 +68,10 @@ class SCCrossEntropy(Metric):
         if self.rollout_as_gt and (next_token_action is not None):
             euclidean_target = next_token_action
 
-        prob_target = _get_prob_targets_center(
+        prob_target = _get_prob_targets_contour(
             target=euclidean_target,  # [n_agent, 16, 3] local x,y,yaw
-            token_traj=token_traj,  # [n_token, 3]
+            token_agent_shape=token_agent_shape,  # [n_agent, 2]
+            token_traj=token_traj,  # [n_token, 4, 2]
         )  # [n_agent, 16, n_token]
 
         loss = cross_entropy(
@@ -91,19 +93,22 @@ class SCCrossEntropy(Metric):
 
 
 @torch.no_grad()
-def _get_prob_targets_center(
+def _get_prob_targets_contour(
     target: Tensor,  # [n_agent, n_step, 3] local x,y,yaw
-    token_traj: Tensor,  # [n_token, 3] endpoint rel_x, rel_y, rel_heading
+    token_agent_shape: Tensor,  # [n_agent, 2]
+    token_traj: Tensor,  # [n_token, 4, 2]
 ) -> Tensor:  # [n_agent, n_step, n_token]
-    """Center-based probability targets (L2 on position)."""
-    # target xy: [n_agent, n_step, 2], token xy: [n_token, 2]
-    target_xy = target[..., :2]  # [n_agent, n_step, 2]
-    token_xy = token_traj[:, :2]  # [n_token, 2]
+    """Contour-based probability targets (sum L2 over 4 corners)."""
+    contour = cal_polygon_contour(
+        target[..., :2],  # [n_agent, n_step, 2]
+        target[..., 2],  # [n_agent, n_step]
+        token_agent_shape[:, None, :],  # [n_agent, 1, 2]
+    )  # [n_agent, n_step, 4, 2]
 
-    # [n_agent, n_step, 1, 2] - [1, 1, n_token, 2]
+    # [n_agent, n_step, 1, 4, 2] - [1, 1, n_token, 4, 2]
     dist = torch.norm(
-        target_xy.unsqueeze(2) - token_xy.unsqueeze(0).unsqueeze(0), dim=-1
-    )  # [n_agent, n_step, n_token]
+        contour.unsqueeze(2) - token_traj[None, None], dim=-1
+    ).sum(-1)  # [n_agent, n_step, n_token]
 
     target_token_index = dist.argmin(-1)  # [n_agent, n_step]
     prob_target = one_hot(target_token_index, num_classes=token_traj.shape[0])

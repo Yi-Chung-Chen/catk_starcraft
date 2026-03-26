@@ -1,6 +1,6 @@
 """StarCraft agent decoder.
 
-No map-to-agent attention. Unified token embedding. Center-based rollout.
+No map-to-agent attention. Unified token embedding. Contour-based rollout.
 """
 
 from typing import Dict, Optional
@@ -15,7 +15,7 @@ from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, transform_to_global, weight_init, wrap_angle
-from src.starcraft.utils.sc_rollout import sample_next_token_traj_center
+from src.starcraft.utils.sc_rollout import sample_next_token_traj_contour
 from src.starcraft.utils.unit_type_map import NUM_UNIT_TYPES
 
 
@@ -49,7 +49,7 @@ class SCAgentDecoder(nn.Module):
         input_dim_x_a = 2
         input_dim_r_t = 4
         input_dim_r_a2a = 3
-        input_dim_token = 3  # [rel_x, rel_y, rel_heading]
+        input_dim_token = 8  # [4 corners * 2 coords], flattened endpoint contour
 
         self.type_a_emb = nn.Embedding(NUM_UNIT_TYPES, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
@@ -109,7 +109,7 @@ class SCAgentDecoder(nn.Module):
     def agent_token_embedding(
         self,
         agent_token_index,  # [n_agent, n_step]
-        trajectory_token,  # [n_token, 3]
+        trajectory_token,  # [n_token, 8]
         pos_a,  # [n_agent, n_step, 2]
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
@@ -314,10 +314,10 @@ class SCAgentDecoder(nn.Module):
             )
         )
 
-        # Token endpoint data for rollout
-        token_traj_all = tokenized_agent["token_traj_all"]  # [n_token, 9, 3]
-        token_endpoint_xy = tokenized_agent["token_traj"][:, :2]  # [n_token, 2]
-        token_endpoint_heading = tokenized_agent["token_traj"][:, 2]  # [n_token]
+        # Token data for rollout
+        token_traj_all = tokenized_agent["token_traj_all"]  # [n_token, 9, 4, 2]
+        token_traj = tokenized_agent["token_traj"]  # [n_token, 4, 2]
+        token_agent_shape = tokenized_agent["token_agent_shape"]  # [n_agent, 2]
 
         if not self.training:
             pred_traj_native = torch.zeros(
@@ -401,11 +401,10 @@ class SCAgentDecoder(nn.Module):
             next_token_logits = self.token_predict_head(feat_a_now)
             next_token_logits_list.append(next_token_logits)
 
-            next_token_idx, next_pos, next_head, next_traj = (
-                sample_next_token_traj_center(
+            next_token_idx, next_token_traj_all = (
+                sample_next_token_traj_contour(
+                    token_traj=token_traj,
                     token_traj_all=token_traj_all,
-                    token_endpoint_xy=token_endpoint_xy,
-                    token_endpoint_heading=token_endpoint_heading,
                     sampling_scheme=sampling_scheme,
                     next_token_logits=next_token_logits,
                     pos_now=pos_a[:, t_now],
@@ -413,32 +412,44 @@ class SCAgentDecoder(nn.Module):
                     pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
                     head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
                     valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
+                    token_agent_shape=token_agent_shape,
+                )
+            )  # next_token_traj_all: [n_agent, 9, 4, 2] in local coords
+
+            # next_token_action from local endpoint (before global transform)
+            diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 3]
+            next_token_action_list.append(
+                torch.cat(
+                    [
+                        next_token_traj_all[:, -1].mean(1),  # [n_agent, 2]
+                        torch.arctan2(diff_xy[:, [1]], diff_xy[:, [0]]),  # [n_agent, 1]
+                    ],
+                    dim=-1,
                 )
             )
 
-            next_token_action_list.append(
-                torch.cat([next_pos, next_head.unsqueeze(-1)], dim=-1)
-            )
+            # Transform entire trajectory to global at once
+            token_traj_global = transform_to_global(
+                pos_local=next_token_traj_all.flatten(1, 2),  # [n_agent, 9*4, 2]
+                head_local=None,
+                pos_now=pos_a[:, t_now],
+                head_now=head_a[:, t_now],
+            )[0].view(n_agent, 9, 4, 2)
 
             if not self.training:
-                # Fill native-fps predictions from token substeps
-                for sub in range(self.shift):
-                    frame_idx = t * self.shift + sub
-                    if frame_idx < n_step_future_native:
-                        # Interpolate substeps in global coords
-                        sub_step = sub + 1  # token_traj_all[0] is start, [1..8] are future
-                        if sub_step < next_traj.shape[1]:
-                            local_xy = next_traj[:, sub_step, :2]  # [n_agent, 2]
-                            local_head = next_traj[:, sub_step, 2]  # [n_agent]
-                            cos_h = torch.cos(head_a[:, t_now])
-                            sin_h = torch.sin(head_a[:, t_now])
-                            gx = cos_h * local_xy[:, 0] - sin_h * local_xy[:, 1] + pos_a[:, t_now, 0]
-                            gy = sin_h * local_xy[:, 0] + cos_h * local_xy[:, 1] + pos_a[:, t_now, 1]
-                            pred_traj_native[:, frame_idx, 0] = gx
-                            pred_traj_native[:, frame_idx, 1] = gy
-                            pred_head_native[:, frame_idx] = wrap_angle(
-                                head_a[:, t_now] + local_head
-                            )
+                # Native-fps: all substeps at once
+                pred_traj_native[:, t * self.shift : (t + 1) * self.shift] = (
+                    token_traj_global[:, 1:].mean(2)
+                )
+                diff_xy_sub = token_traj_global[:, 1:, 0] - token_traj_global[:, 1:, 3]
+                pred_head_native[:, t * self.shift : (t + 1) * self.shift] = (
+                    torch.atan2(diff_xy_sub[:, :, 1], diff_xy_sub[:, :, 0])
+                )
+
+            # Extract next_pos/next_head from global endpoint
+            next_pos = token_traj_global[:, -1].mean(dim=1)  # [n_agent, 2]
+            diff_xy_next = token_traj_global[:, -1, 0] - token_traj_global[:, -1, 3]
+            next_head = torch.arctan2(diff_xy_next[:, 1], diff_xy_next[:, 0])
 
             pred_idx[:, n_step] = next_token_idx
             pred_valid[:, n_step] = pred_valid[:, t_now]

@@ -54,7 +54,7 @@ class SCSMART(LightningModule):
         loss = self.training_loss(
             **pred,
             token_agent_shape=tokenized_agent["token_agent_shape"],
-            token_traj=tokenized_agent["token_traj"],  # [n_token, 3]
+            token_traj=tokenized_agent["token_traj"],  # [n_token, 4, 2]
             train_mask=data["agent"]["train_mask"],
         )
         self.log("train/loss", loss, on_step=True, batch_size=1)

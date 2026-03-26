@@ -1,6 +1,6 @@
 """StarCraft token processor.
 
-Unified motion dictionary, center+heading matching, no map tokenization.
+Unified motion dictionary, contour-based matching, no map tokenization.
 """
 
 import pickle
@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
-from src.smart.utils import transform_to_global, transform_to_local, wrap_angle
+from src.smart.utils import cal_polygon_contour, transform_to_global, transform_to_local, wrap_angle
 
 
 class SCTokenProcessor(torch.nn.Module):
@@ -33,12 +33,16 @@ class SCTokenProcessor(torch.nn.Module):
 
     def _init_agent_token(self, path: str) -> None:
         data = pickle.load(open(path, "rb"))
-        centers = torch.tensor(data["cluster_centers"], dtype=torch.float32)
-        # centers: [n_token, 9, 3] where 3 = [rel_x, rel_y, rel_heading]
-        self.register_buffer("agent_token_all", centers, persistent=False)
-        # endpoint: [n_token, 3] — last frame of each token
+        contours = torch.tensor(data["cluster_centers"], dtype=torch.float32)
+        # contours: [n_token, 9, 4, 2] where 4 = corners (LF, RF, RB, LB), 2 = [x, y]
+        assert contours.ndim == 4 and contours.shape[-2:] == (4, 2), (
+            f"Expected motion dict shape (n_token, 9, 4, 2), got {contours.shape}. "
+            "The dictionary file may still be in the old center-based (n_token, 9, 3) format."
+        )
+        self.register_buffer("agent_token_all", contours, persistent=False)
+        # endpoint contour: [n_token, 4, 2] — last frame of each token
         self.register_buffer(
-            "agent_token_endpoint", centers[:, -1].contiguous(), persistent=False
+            "agent_token_endpoint", contours[:, -1].contiguous(), persistent=False
         )
 
     @torch.no_grad()
@@ -62,21 +66,19 @@ class SCTokenProcessor(torch.nn.Module):
         # Stationary-fill extrapolation (no velocity needed)
         valid, pos, heading = self._extrapolate_stationary(valid, pos, heading)
 
-        # Token endpoint for matching: [n_token, 2] (xy only)
-        token_endpoint_xy = self.agent_token_endpoint[:, :2]  # [n_token, 2]
-        token_endpoint_heading = self.agent_token_endpoint[:, 2]  # [n_token]
+        agent_shape = data["agent"]["shape"][:, :2]  # [n_agent, 2]
 
         tokenized_agent = {
             "num_graphs": data.num_graphs,
             "type": data["agent"]["type"],
             "shape": data["agent"]["shape"],
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent], all False for SC
-            "token_agent_shape": data["agent"]["shape"][:, :2],  # [n_agent, 2]
+            "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
             # Token vocabulary (shared across all agents/types)
-            "token_traj_all": self.agent_token_all,  # [n_token, 9, 3]
-            "token_traj": self.agent_token_endpoint,  # [n_token, 3]
-            "trajectory_token": self.agent_token_endpoint,  # [n_token, 3]
+            "token_traj_all": self.agent_token_all,  # [n_token, 9, 4, 2]
+            "token_traj": self.agent_token_endpoint,  # [n_token, 4, 2]
+            "trajectory_token": self.agent_token_endpoint.flatten(-2, -1),  # [n_token, 8]
             # GT at token boundaries: steps {8, 16, 24, ..., 144}
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, 18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, 18]
@@ -89,29 +91,29 @@ class SCTokenProcessor(torch.nn.Module):
             ]
 
         # Match tokens
-        token_dict = self._match_agent_token_center(
+        token_dict = self._match_agent_token_contour(
             valid=valid,
             pos=pos,
             heading=heading,
-            token_endpoint_xy=token_endpoint_xy,
-            token_endpoint_heading=token_endpoint_heading,
+            agent_shape=agent_shape,
+            token_traj=self.agent_token_endpoint,  # [n_token, 4, 2]
         )
         tokenized_agent.update(token_dict)
         return tokenized_agent
 
-    def _match_agent_token_center(
+    def _match_agent_token_contour(
         self,
         valid: Tensor,  # [n_agent, T]
         pos: Tensor,  # [n_agent, T, 2]
         heading: Tensor,  # [n_agent, T]
-        token_endpoint_xy: Tensor,  # [n_token, 2]
-        token_endpoint_heading: Tensor,  # [n_token]
+        agent_shape: Tensor,  # [n_agent, 2]
+        token_traj: Tensor,  # [n_token, 4, 2]
     ) -> Dict[str, Tensor]:
-        """Center-based token matching. No polygon contour needed."""
+        """Contour-based token matching following SMART pattern."""
         num_k = self.agent_token_sampling.num_k if self.training else 1
         n_agent, n_step = valid.shape
         range_a = torch.arange(n_agent, device=valid.device)
-        n_token = token_endpoint_xy.shape[0]
+        n_token = token_traj.shape[0]
 
         prev_pos = pos[:, 0]  # [n_agent, 2]
         prev_head = heading[:, 0]  # [n_agent]
@@ -133,38 +135,33 @@ class SCTokenProcessor(torch.nn.Module):
             _invalid = ~_valid
             out["valid_mask"].append(_valid)
 
-            gt_pos_i = pos[:, i]  # [n_agent, 2]
+            # GT contour: [n_agent, 4, 2] in global coord
+            gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
+            gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
 
-            # Transform token endpoints from local to global using prev_pos/prev_head
-            # token_endpoint_xy: [n_token, 2] -> broadcast to [n_agent, n_token, 2]
-            cos_h = torch.cos(prev_head)  # [n_agent]
-            sin_h = torch.sin(prev_head)  # [n_agent]
-            # Rotate: global = R(heading) @ local + pos
-            tx = token_endpoint_xy[:, 0]  # [n_token]
-            ty = token_endpoint_xy[:, 1]  # [n_token]
-            # [n_agent, n_token]
-            global_x = cos_h.unsqueeze(1) * tx.unsqueeze(0) - sin_h.unsqueeze(1) * ty.unsqueeze(0) + prev_pos[:, 0:1]
-            global_y = sin_h.unsqueeze(1) * tx.unsqueeze(0) + cos_h.unsqueeze(1) * ty.unsqueeze(0) + prev_pos[:, 1:2]
+            # Expand shared vocab for transform_to_global
+            token_expanded = token_traj.unsqueeze(0).expand(n_agent, -1, -1, -1)
+            # [n_agent, n_token, 4, 2]
+            token_world_gt = transform_to_global(
+                pos_local=token_expanded.flatten(1, 2),  # [n_agent, n_token*4, 2]
+                head_local=None,
+                pos_now=prev_pos,
+                head_now=prev_head,
+            )[0].view(n_agent, n_token, 4, 2)
 
-            # Distance: [n_agent, n_token]
-            dist = (global_x - gt_pos_i[:, 0:1]) ** 2 + (global_y - gt_pos_i[:, 1:2]) ** 2
+            # Match: sum L2 over corners
+            token_idx_gt = torch.argmin(
+                torch.norm(token_world_gt - gt_contour, dim=-1).sum(-1), dim=-1
+            )  # [n_agent]
 
-            # GT: argmin distance
-            token_idx_gt = torch.argmin(dist, dim=-1)  # [n_agent]
+            # Extract pos/head from matched contour
+            token_contour_gt = token_world_gt[range_a, token_idx_gt]  # [n_agent, 4, 2]
 
-            # Update prev state using matched token
-            matched_global_x = global_x[range_a, token_idx_gt]  # [n_agent]
-            matched_global_y = global_y[range_a, token_idx_gt]  # [n_agent]
-            matched_heading_delta = token_endpoint_heading[token_idx_gt]  # [n_agent]
-
-            new_pos_gt = torch.stack([matched_global_x, matched_global_y], dim=-1)
-            new_head_gt = wrap_angle(prev_head + matched_heading_delta)
-
-            # For invalid agents, fall back to raw GT
-            prev_pos = pos[:, i].clone()
-            prev_pos[_valid] = new_pos_gt[_valid]
             prev_head = heading[:, i].clone()
-            prev_head[_valid] = new_head_gt[_valid]
+            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
+            prev_head[_valid] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid]
+            prev_pos = pos[:, i].clone()
+            prev_pos[_valid] = token_contour_gt.mean(1)[_valid]
 
             out["gt_idx"].append(token_idx_gt)
             out["gt_pos"].append(prev_pos.masked_fill(_invalid.unsqueeze(1), 0))
@@ -177,31 +174,29 @@ class SCTokenProcessor(torch.nn.Module):
                 out["sampled_heading"].append(out["gt_heading"][-1])
             else:
                 # Transform using sampled state
-                cos_s = torch.cos(prev_head_sample)
-                sin_s = torch.sin(prev_head_sample)
-                g_x = cos_s.unsqueeze(1) * tx.unsqueeze(0) - sin_s.unsqueeze(1) * ty.unsqueeze(0) + prev_pos_sample[:, 0:1]
-                g_y = sin_s.unsqueeze(1) * tx.unsqueeze(0) + cos_s.unsqueeze(1) * ty.unsqueeze(0) + prev_pos_sample[:, 1:2]
+                token_world_sample = transform_to_global(
+                    pos_local=token_expanded.flatten(1, 2),
+                    head_local=None,
+                    pos_now=prev_pos_sample,
+                    head_now=prev_head_sample,
+                )[0].view(n_agent, n_token, 4, 2)
 
-                dist_s = (g_x - gt_pos_i[:, 0:1]) ** 2 + (g_y - gt_pos_i[:, 1:2]) ** 2
-
+                # dist: [n_agent, n_token]
+                dist = torch.norm(token_world_sample - gt_contour, dim=-1).mean(-1)
                 topk_dists, topk_indices = torch.topk(
-                    dist_s, num_k, dim=-1, largest=False, sorted=False
+                    dist, num_k, dim=-1, largest=False, sorted=False
                 )
+
                 topk_logits = (-1.0 * topk_dists) / self.agent_token_sampling.temp
                 _samples = Categorical(logits=topk_logits).sample()
                 token_idx_s = topk_indices[range_a, _samples]
+                token_contour_s = token_world_sample[range_a, token_idx_s]
 
-                m_gx = g_x[range_a, token_idx_s]
-                m_gy = g_y[range_a, token_idx_s]
-                m_dh = token_endpoint_heading[token_idx_s]
-
-                new_pos_s = torch.stack([m_gx, m_gy], dim=-1)
-                new_head_s = wrap_angle(prev_head_sample + m_dh)
-
-                prev_pos_sample = pos[:, i].clone()
-                prev_pos_sample[_valid] = new_pos_s[_valid]
                 prev_head_sample = heading[:, i].clone()
-                prev_head_sample[_valid] = new_head_s[_valid]
+                dxy = token_contour_s[:, 0] - token_contour_s[:, 3]
+                prev_head_sample[_valid] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid]
+                prev_pos_sample = pos[:, i].clone()
+                prev_pos_sample[_valid] = token_contour_s.mean(1)[_valid]
 
                 out["sampled_idx"].append(token_idx_s)
                 out["sampled_pos"].append(
