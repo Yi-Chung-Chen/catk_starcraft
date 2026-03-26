@@ -21,15 +21,15 @@ model_config:
     num_k: -1
     temp: 1.0
   decoder:
-    hidden_dim: 128
+    hidden_dim: 64
     num_freq_bands: 64
-    num_heads: 8
-    head_dim: 16
+    num_heads: 4
+    head_dim: 8
     dropout: 0.1
     hist_drop_prob: 0.1
-    num_agent_layers: 6
-    a2a_radius: 30
-    time_span: 30
+    num_agent_layers: 4
+    a2a_radius: 10
+    time_span: 48
     num_historical_steps: 17
     num_future_steps: 128
   training_loss:
