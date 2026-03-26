@@ -101,12 +101,24 @@ class SCSMART(LightningModule):
                 pred_traj.append(pred["pred_traj_native"])
 
             pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
+
+            # Agents not alive at the current frame have no valid initial position,
+            # so their predictions are garbage (centered at origin).  Exclude them
+            # from metrics and visualization, mirroring the train_mask filter.
+            alive_at_current = data["agent"]["valid_mask"][
+                :, self.num_historical_steps - 1
+            ]
+            target_valid = (
+                data["agent"]["valid_mask"][:, self.num_historical_steps :]
+                & alive_at_current.unsqueeze(1)
+            )
+
             self.minADE.update(
                 pred=pred_traj,
                 target=data["agent"]["position"][
                     :, self.num_historical_steps :, :pred_traj.shape[-1]
                 ],
-                target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
+                target_valid=target_valid,
             )
             self.log("val_closed/ADE", self.minADE, on_epoch=True, sync_dist=True, batch_size=1)
 
@@ -117,6 +129,7 @@ class SCSMART(LightningModule):
                     for i_roll in range(n_rollouts_vis):
                         sc_data = extract_scenario_data(
                             data, pred_traj, i_sc, i_roll,
+                            num_historical_steps=self.num_historical_steps,
                         )
                         save_dir = (
                             self.gif_dir

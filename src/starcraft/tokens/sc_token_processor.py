@@ -56,7 +56,7 @@ class SCTokenProcessor(torch.nn.Module):
         return {}
 
     def tokenize_agent(self, data: HeteroData) -> Dict[str, Tensor]:
-        valid = data["agent"]["valid_mask"]  # [n_agent, T]
+        valid = data["agent"]["valid_mask"].clone()  # [n_agent, T]
         heading = data["agent"]["heading"].clone()  # [n_agent, T]
         pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, T, 2]
 

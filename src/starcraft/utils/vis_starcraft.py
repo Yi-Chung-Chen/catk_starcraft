@@ -7,13 +7,13 @@ matplotlib.use("Agg")
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
-import torch
 
 TOTAL_FRAMES = 145
 FPS = 16  # native frame rate
 
 
-def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx):
+def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
+                          num_historical_steps=17):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -21,17 +21,26 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx):
         pred_traj: (N_batch, n_rollout, n_future_steps, 2) predicted trajectories.
         scenario_idx: Which scenario in the batch to extract.
         rollout_idx: Which rollout to extract.
+        num_historical_steps: Agents must be alive at frame
+            (num_historical_steps - 1) to have valid predictions.
 
     Returns:
         Dict with numpy arrays for one scenario + one rollout.
     """
     batch = data["agent"]["batch"]
     mask = batch == scenario_idx
+    valid = data["agent"]["valid_mask"][mask]
+
+    # Agents alive at the current frame have valid model predictions.
+    # Agents spawning later started from (0,0) and must be excluded.
+    current_frame = num_historical_steps - 1
+    pred_agent_mask = valid[:, current_frame].cpu().numpy()
 
     return {
         "gt_positions": data["agent"]["position"][mask, :, :2].cpu().numpy(),
-        "gt_valid": data["agent"]["valid_mask"][mask].cpu().numpy(),
+        "gt_valid": valid.cpu().numpy(),
         "pred_positions": pred_traj[mask, rollout_idx].cpu().numpy(),
+        "pred_agent_mask": pred_agent_mask,
         "owner": data["agent"]["owner"][mask].cpu().numpy(),
         "scenario_id": data["scenario_id"][scenario_idx],
     }
@@ -41,6 +50,7 @@ def save_scenario_gif(
     gt_positions,
     gt_valid,
     pred_positions,
+    pred_agent_mask,
     owner,
     scenario_id,
     save_path,
@@ -55,6 +65,9 @@ def save_scenario_gif(
         gt_positions: (N, T, 2) ground-truth XY positions for all T frames.
         gt_valid: (N, T) boolean alive mask.
         pred_positions: (N, T_pred, 2) predicted XY, starting from frame num_historical_steps.
+        pred_agent_mask: (N,) bool — True for agents alive at the current frame
+            whose predictions are valid.  Agents spawning later have garbage
+            predictions (origin) and are excluded.
         owner: (N,) player ownership (1=P1, 2=P2, 16=Neutral).
         scenario_id: String identifier for the scenario.
         save_path: Output GIF path.
@@ -137,14 +150,14 @@ def save_scenario_gif(
         )
         gt_trail_lines.append((u, line))
 
-    # Pred trail lines (dashed) for mobile player units
+    # Pred trail lines (dashed) for mobile player units with valid predictions
     pred_trail_lines = []
-    for u in np.where(mobile & p1_mask)[0]:
+    for u in np.where(mobile & p1_mask & pred_agent_mask)[0]:
         (line,) = ax.plot(
             [], [], "--", color="cornflowerblue", alpha=0.3, linewidth=1.2, zorder=3,
         )
         pred_trail_lines.append((u, line))
-    for u in np.where(mobile & p2_mask)[0]:
+    for u in np.where(mobile & p2_mask & pred_agent_mask)[0]:
         (line,) = ax.plot(
             [], [], "--", color="salmon", alpha=0.3, linewidth=1.2, zorder=3,
         )
@@ -184,21 +197,18 @@ def save_scenario_gif(
             else:
                 line.set_data([], [])
 
-        # --- Predicted positions ---
+        # --- Predicted positions (only for agents with valid initial state) ---
         if frame_idx >= num_historical_steps:
             pred_idx = frame_idx - num_historical_steps
-            # Show pred for agents alive at current frame in GT
-            pred_p1_alive = gt_valid[:, frame_idx] & p1_mask
-            pred_p2_alive = gt_valid[:, frame_idx] & p2_mask
+            pred_p1_alive = gt_valid[:, frame_idx] & p1_mask & pred_agent_mask
+            pred_p2_alive = gt_valid[:, frame_idx] & p2_mask & pred_agent_mask
 
             scat_pred_p1.set_offsets(pred_positions[pred_p1_alive, pred_idx])
             scat_pred_p2.set_offsets(pred_positions[pred_p2_alive, pred_idx])
 
             # Pred trails
-            pred_t_start = max(0, pred_idx - trail_length)
             for u, line in pred_trail_lines:
                 if gt_valid[u, frame_idx]:
-                    # For pred trails, we don't have a per-frame valid, use gt as proxy
                     seg_start = max(0, pred_idx - trail_length)
                     seg = pred_positions[u, seg_start : pred_idx + 1]
                     line.set_data(seg[:, 0], seg[:, 1])
