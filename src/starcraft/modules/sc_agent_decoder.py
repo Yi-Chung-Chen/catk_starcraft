@@ -195,7 +195,8 @@ class SCAgentDecoder(nn.Module):
         r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
         return edge_index_t, r_t
 
-    def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask):
+    def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask,
+                               owner=None, visible_status=None):
         mask = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
@@ -208,6 +209,27 @@ class SCAgentDecoder(nn.Module):
             max_num_neighbors=300,
         )
         edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
+
+        # Fog-of-war visibility filtering: observer's player must currently see the source unit
+        if owner is not None and visible_status is not None:
+            n_step = pos_a.shape[1]
+            owner_s = owner.unsqueeze(0).expand(n_step, -1).reshape(-1)
+            vis_s = visible_status.transpose(0, 1).reshape(-1).to(edge_index_a2a.device)
+
+            src = edge_index_a2a[0]
+            tgt = edge_index_a2a[1]
+            obs_owner = owner_s[tgt]
+            src_vs = vis_s[src]
+            p1_state = src_vs // 3
+            p2_state = src_vs % 3
+
+            vis_ok = torch.ones(src.shape[0], dtype=torch.bool, device=src.device)
+            vis_ok[obs_owner == 1] = (p1_state[obs_owner == 1] == 2)
+            vis_ok[obs_owner == 2] = (p2_state[obs_owner == 2] == 2)
+            # Neutral observers (owner=16): vis_ok stays True
+
+            edge_index_a2a = edge_index_a2a[:, vis_ok]
+
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
         r_a2a = torch.stack(
@@ -259,6 +281,8 @@ class SCAgentDecoder(nn.Module):
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
             batch_s=batch_s, mask=mask,
+            owner=tokenized_agent["owner"],
+            visible_status=tokenized_agent["visible_status"],
         )
 
         # Attention layers: temporal + agent-to-agent (no map-to-agent)
@@ -368,6 +392,8 @@ class SCAgentDecoder(nn.Module):
                 head_vector_a=head_vector_a[:, -hist_step:],
                 batch_s=batch_s,
                 mask=inference_mask[:, -hist_step:],
+                owner=tokenized_agent["owner"],
+                visible_status=tokenized_agent["visible_status"][:, n_step - hist_step:n_step],
             )
 
             for i in range(self.num_layers):

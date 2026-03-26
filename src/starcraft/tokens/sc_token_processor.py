@@ -75,6 +75,9 @@ class SCTokenProcessor(torch.nn.Module):
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent], all False for SC
             "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
+            # Ownership and visibility for fog-of-war edge filtering
+            "owner": data["agent"]["owner"],  # [n_agent]
+            "visible_status": data["agent"]["visible_status"][:, self.shift :: self.shift],  # [n_agent, 18]
             # Token vocabulary (shared across all agents/types)
             "token_traj_all": self.agent_token_all,  # [n_token, 9, 4, 2]
             "token_traj": self.agent_token_endpoint,  # [n_token, 4, 2]
