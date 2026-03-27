@@ -5,12 +5,31 @@ Indices:
     1 = Unknown (unmapped unit type)
     2..NUM_UNIT_TYPES-1 = known unit types, sorted by raw SC2 API ID
 
-Reference: sc2sensor/utils/unit_type_data.py from starcraft-motion-private
+Source: pysc2.lib.units from the installed PySC2 package.
+Reference: https://github.com/google-deepmind/pysc2/blob/master/pysc2/lib/units.py
+This static ID table was generated from PySC2 to avoid a runtime dependency on
+`pysc2` in this repo. It intentionally follows PySC2's unit classification,
+including SC2 ID 135 = Protoss.ForceField.
 """
 
 import numpy as np
 
-# ── Raw SC2 API unit type IDs by race ────────────────────────────────────────
+# Static SC2 API unit type IDs vendored from PySC2, grouped to match the
+# upstream pysc2.lib.units layout for easier manual comparison.
+_NEUTRAL_IDS = [
+    146, 147, 149, 321, 322, 324, 330, 335, 336, 341, 342, 343, 344, 350,
+    364, 365, 371, 372, 373, 376, 377, 472, 473, 474, 475, 483, 485, 486,
+    487, 490, 517, 518, 559, 560, 561, 562, 563, 564, 588, 589, 590, 591,
+    608, 609, 610, 612, 628, 629, 630, 638, 639, 640, 641, 642, 643, 648,
+    649, 651, 661, 662, 663, 664, 665, 666, 796, 797, 877, 880, 881, 884,
+    885, 886, 887, 1904, 1908, 1957, 1958, 1961,
+]
+
+_PROTOSS_IDS = [
+    4, 10, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
+    75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 133, 135, 136, 141, 311,
+    488, 495, 496, 694, 732, 733, 801, 894, 1910, 1911, 1955,
+]
 
 _TERRAN_IDS = [
     5, 6, 11, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
@@ -28,28 +47,10 @@ _ZERG_IDS = [
     1956,
 ]
 
-_PROTOSS_IDS = [
-    4, 10, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
-    75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 133, 136, 141, 311, 488,
-    495, 496, 694, 732, 733, 801, 894, 1910, 1911, 1955,
-]
-
-_NEUTRAL_IDS = [
-    135, 146, 147, 149, 321, 322, 324, 330, 335, 336, 341, 342, 343, 344,
-    350, 364, 365, 371, 372, 373, 376, 377, 472, 473, 474, 475, 483, 485,
-    486, 487, 490, 517, 518, 559, 560, 561, 562, 563, 564, 588, 589, 590,
-    591, 608, 609, 610, 612, 628, 629, 630, 638, 639, 640, 641, 642, 643,
-    648, 649, 651, 661, 662, 663, 664, 665, 666, 796, 797, 877, 880, 881,
-    884, 885, 886, 887, 1879, 1883, 1904, 1908, 1957, 1958, 1961,
-]
-
-# ── Build global mapping ─────────────────────────────────────────────────────
-
 EMPTY_INDEX = 0
 UNKNOWN_INDEX = 1
 
-# All known SC2 IDs sorted ascending, then assigned contiguous indices from 2
-_ALL_SC2_IDS = sorted(set(_TERRAN_IDS + _ZERG_IDS + _PROTOSS_IDS + _NEUTRAL_IDS))
+_ALL_SC2_IDS = sorted(set(_NEUTRAL_IDS + _PROTOSS_IDS + _TERRAN_IDS + _ZERG_IDS))
 
 SC2_ID_TO_INDEX: dict[int, int] = {
     sc2_id: idx + 2 for idx, sc2_id in enumerate(_ALL_SC2_IDS)
