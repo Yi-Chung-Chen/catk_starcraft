@@ -23,8 +23,9 @@ python \
   model.model_config.val_closed_loop=true \
   model.model_config.val_open_loop=false \
   model.model_config.n_rollout_closed_val=1 \
-  model.model_config.n_vis_batch=2 \
-  trainer.limit_val_batches=10 \
+  model.model_config.n_vis_batch=125 \
+  model.model_config.n_vis_scenario=4 \
+  trainer.limit_val_batches=125 \
   task_name=$MY_TASK_NAME
 
 echo "bash local_val_sc.sh done!"
