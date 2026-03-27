@@ -47,10 +47,61 @@ _ZERG_IDS = [
     1956,
 ]
 
+# Repo-maintained semantic metadata built on top of the vendored PySC2 IDs.
+# This is not a direct PySC2 API export. Important edge cases:
+# - 135 = Protoss.ForceField is static.
+# - Flying Terran structures are moving, but PlanetaryFortress is static.
+# - Uprooted Spine/Spore Crawlers are moving.
+# - Mode variants of fundamentally mobile units stay moving.
+# - NydusCanal is static.
+_MOVING_TERRAN_IDS = [
+    32, 33, 34, 35, 36, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+    57, 134, 144, 145, 268, 484, 498, 500, 689, 691, 692, 734,
+]
+
+_MOVING_PROTOSS_IDS = [
+    4, 10, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 136, 141,
+    311, 488, 495, 496, 694, 733, 801, 1911,
+]
+
+_MOVING_ZERG_IDS = [
+    7, 9, 12, 13, 14, 15, 16, 17, 104, 105, 106, 107, 108, 109, 110, 111,
+    112, 114, 115, 116, 117, 118, 119, 120, 125, 126, 127, 129, 131, 139,
+    140, 143, 289, 489, 493, 494, 499, 502, 503, 688, 690, 693, 893, 1912,
+]
+
+_STATIC_TERRAN_IDS = [
+    5, 6, 11, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 37,
+    38, 39, 40, 41, 42, 47, 58, 130, 132, 830, 1913, 1960,
+]
+
+_STATIC_PROTOSS_IDS = [
+    59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 133, 135, 732,
+    894, 1910, 1955,
+]
+
+_STATIC_ZERG_IDS = [
+    8, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101,
+    102, 103, 113, 128, 137, 138, 142, 150, 151, 501, 504, 687, 824, 892,
+    1956,
+]
+
+_STATIC_NEUTRAL_IDS = list(_NEUTRAL_IDS)
+
 EMPTY_INDEX = 0
 UNKNOWN_INDEX = 1
 
 _ALL_SC2_IDS = sorted(set(_NEUTRAL_IDS + _PROTOSS_IDS + _TERRAN_IDS + _ZERG_IDS))
+
+MOVING_UNIT_TYPE_IDS = frozenset(
+    _MOVING_TERRAN_IDS + _MOVING_PROTOSS_IDS + _MOVING_ZERG_IDS
+)
+STATIC_UNIT_TYPE_IDS = frozenset(
+    _STATIC_TERRAN_IDS
+    + _STATIC_PROTOSS_IDS
+    + _STATIC_ZERG_IDS
+    + _STATIC_NEUTRAL_IDS
+)
 
 SC2_ID_TO_INDEX: dict[int, int] = {
     sc2_id: idx + 2 for idx, sc2_id in enumerate(_ALL_SC2_IDS)
@@ -73,3 +124,11 @@ def remap_unit_type(raw_ids: np.ndarray) -> np.ndarray:
     for sc2_id, idx in SC2_ID_TO_INDEX.items():
         out[raw_ids == sc2_id] = idx
     return out
+
+
+def is_moving_unit_type(unit_type_id: int) -> bool:
+    return unit_type_id in MOVING_UNIT_TYPE_IDS
+
+
+def is_static_unit_type(unit_type_id: int) -> bool:
+    return unit_type_id in STATIC_UNIT_TYPE_IDS
