@@ -1,9 +1,8 @@
 """Global mapping from SC2 unit_type_id to contiguous indices.
 
 Indices:
-    0 = Empty (no unit)
-    1 = Unknown (unmapped unit type)
-    2..NUM_UNIT_TYPES-1 = known unit types, sorted by raw SC2 API ID
+    0 = Unknown (unmapped unit type)
+    1..NUM_UNIT_TYPES-1 = known unit types, sorted by raw SC2 API ID
 
 Source: pysc2.lib.units from the installed PySC2 package.
 Reference: https://github.com/google-deepmind/pysc2/blob/master/pysc2/lib/units.py
@@ -505,8 +504,7 @@ _PROTOSS_IDS = _ids(_PROTOSS_UNITS)
 _TERRAN_IDS = _ids(_TERRAN_UNITS)
 _ZERG_IDS = _ids(_ZERG_UNITS)
 
-EMPTY_INDEX = 0
-UNKNOWN_INDEX = 1
+UNKNOWN_INDEX = 0
 
 _ALL_SC2_IDS = sorted(set(_NEUTRAL_IDS + _PROTOSS_IDS + _TERRAN_IDS + _ZERG_IDS))
 
@@ -537,10 +535,10 @@ UNIT_ID_TO_RACE = {
 }
 
 SC2_ID_TO_INDEX: dict[int, int] = {
-    sc2_id: idx + 2 for idx, sc2_id in enumerate(_ALL_SC2_IDS)
+    sc2_id: idx + 1 for idx, sc2_id in enumerate(_ALL_SC2_IDS)
 }
 
-NUM_UNIT_TYPES: int = len(_ALL_SC2_IDS) + 2  # +2 for Empty and Unknown
+NUM_UNIT_TYPES: int = len(_ALL_SC2_IDS) + 1  # +1 for Unknown
 
 
 def remap_unit_type(raw_ids: np.ndarray) -> np.ndarray:

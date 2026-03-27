@@ -4,9 +4,9 @@ from src.starcraft.utils import unit_type_map
 
 
 def test_unit_type_map_constants_and_known_ids():
-    assert unit_type_map.EMPTY_INDEX == 0
-    assert unit_type_map.UNKNOWN_INDEX == 1
-    assert unit_type_map.NUM_UNIT_TYPES == len(unit_type_map.SC2_ID_TO_INDEX) + 2
+    assert not hasattr(unit_type_map, "EMPTY_INDEX")
+    assert unit_type_map.UNKNOWN_INDEX == 0
+    assert unit_type_map.NUM_UNIT_TYPES == len(unit_type_map.SC2_ID_TO_INDEX) + 1
 
     for sc2_id in (48, 73, 105, 135, 146):
         assert unit_type_map.SC2_ID_TO_INDEX[sc2_id] > unit_type_map.UNKNOWN_INDEX
