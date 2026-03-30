@@ -1,6 +1,6 @@
 """StarCraft map encoder.
 
-CNN-based encoder that processes static map grids (pathing + height) into
+CNN-based encoder that processes map grids (pathing + height + creep) into
 patch tokens for map-to-agent attention. No sparse self-attention — the CNN
 receptive field handles spatial context within the well-structured grid.
 """
@@ -25,8 +25,9 @@ class SCMapEncoder(nn.Module):
     ) -> None:
         super().__init__()
         # Build CNN with num_layers stride-2 conv layers → total 2^num_layers downsampling.
-        # Input: [B, 2, 200, 200] → Output: [B, hidden_dim, 25, 25] (for num_layers=3).
-        channels = [2] + [min(32 * (2 ** i), hidden_dim) for i in range(num_layers - 1)] + [hidden_dim]
+        # Input: [B, 3, 200, 200] → Output: [B, hidden_dim, 25, 25] (for num_layers=3).
+        # 3 input channels: pathing_grid, height_map, creep.
+        channels = [3] + [min(32 * (2 ** i), hidden_dim) for i in range(num_layers - 1)] + [hidden_dim]
         layers = []
         for i in range(num_layers):
             layers.append(nn.Conv2d(channels[i], channels[i + 1], kernel_size=3, stride=2, padding=1))

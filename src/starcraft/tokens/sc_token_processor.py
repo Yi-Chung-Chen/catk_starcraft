@@ -122,15 +122,21 @@ class SCTokenProcessor(torch.nn.Module):
         valid_masks = []
         batch_indices = []
 
+        # data["creep"] is (B*200, 200) after PyG concatenation (pre-padded in dataset)
+        # Move to CPU for cat with cached static grids; entire dict moves to device at return
+        creep_batch = data["creep"].cpu().view(batch_size, _PADDED_SIZE, _PADDED_SIZE)  # [B, 200, 200]
+
         for i, name in enumerate(map_names):
             m = self._load_and_preprocess_map(name)
-            grids.append(m["map_grid"])
+            static_grid = m["map_grid"]  # [2, 200, 200]
+            # Concatenate creep as 3rd channel
+            grids.append(torch.cat([static_grid, creep_batch[i].unsqueeze(0)], dim=0))  # [3, 200, 200]
             positions.append(m["position"])
             valid_masks.append(m["valid_mask"])
             batch_indices.append(torch.full((n_patches,), i, dtype=torch.long))
 
         return {
-            "map_grid": torch.stack(grids, dim=0).to(device),          # [B, 2, 200, 200]
+            "map_grid": torch.stack(grids, dim=0).to(device),          # [B, 3, 200, 200]
             "position": torch.cat(positions, dim=0).to(device),        # [B*625, 2]
             "valid_mask": torch.cat(valid_masks, dim=0).to(device),    # [B*625]
             "batch": torch.cat(batch_indices, dim=0).to(device),       # [B*625]
