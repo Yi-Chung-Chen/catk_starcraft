@@ -1,4 +1,4 @@
-"""StarCraft decoder. Agent-only (no map encoder)."""
+"""StarCraft decoder. Map encoder (CNN) + agent decoder with pl2a attention."""
 
 from typing import Dict, Optional
 
@@ -7,6 +7,7 @@ from omegaconf import DictConfig
 from torch import Tensor
 
 from .sc_agent_decoder import SCAgentDecoder
+from .sc_map_encoder import SCMapEncoder
 
 
 class SCDecoder(nn.Module):
@@ -17,6 +18,8 @@ class SCDecoder(nn.Module):
         num_historical_steps: int,
         num_future_steps: int,
         time_span: Optional[int],
+        num_map_layers: int,
+        pl2a_radius: float,
         a2a_radius: float,
         num_freq_bands: int,
         num_agent_layers: int,
@@ -27,11 +30,19 @@ class SCDecoder(nn.Module):
         n_token_agent: int,
     ) -> None:
         super().__init__()
+        self.map_encoder = SCMapEncoder(
+            hidden_dim=hidden_dim,
+            num_layers=num_map_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+        )
         self.agent_encoder = SCAgentDecoder(
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
             time_span=time_span,
+            pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
             num_freq_bands=num_freq_bands,
             num_layers=num_agent_layers,
@@ -45,7 +56,8 @@ class SCDecoder(nn.Module):
     def forward(
         self, tokenized_map: Dict[str, Tensor], tokenized_agent: Dict[str, Tensor]
     ) -> Dict[str, Tensor]:
-        return self.agent_encoder(tokenized_agent, tokenized_map)
+        map_feature = self.map_encoder(tokenized_map)
+        return self.agent_encoder(tokenized_agent, map_feature)
 
     def inference(
         self,
@@ -53,4 +65,5 @@ class SCDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         sampling_scheme: DictConfig,
     ) -> Dict[str, Tensor]:
-        return self.agent_encoder.inference(tokenized_agent, tokenized_map, sampling_scheme)
+        map_feature = self.map_encoder(tokenized_map)
+        return self.agent_encoder.inference(tokenized_agent, map_feature, sampling_scheme)

@@ -12,6 +12,7 @@ model_config:
   val_closed_loop: false
   token_processor:
     motion_dict_file: ${paths.sc_motion_dict}
+    map_data_dir: ${paths.sc_map_data}
     agent_token_sampling:
       num_k: 1
       temp: 1.0
@@ -30,6 +31,8 @@ model_config:
     head_dim: 8
     dropout: 0.1
     hist_drop_prob: 0.1
+    num_map_layers: 3
+    pl2a_radius: 20
     num_agent_layers: 4
     a2a_radius: 10
     time_span: 48

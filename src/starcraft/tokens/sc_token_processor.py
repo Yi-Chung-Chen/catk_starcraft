@@ -1,12 +1,15 @@
 """StarCraft token processor.
 
-Unified motion dictionary, contour-based matching, no map tokenization.
+Unified motion dictionary, contour-based matching, CNN-ready map tokenization.
 """
 
+import os
 import pickle
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
+import h5py
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributions import Categorical
@@ -14,16 +17,23 @@ from torch_geometric.data import HeteroData
 
 from src.smart.utils import cal_polygon_contour, transform_to_global, transform_to_local, wrap_angle
 
+_PADDED_SIZE = 200  # all maps padded to 200x200
+_PATCH_STRIDE = 8   # CNN stride-8 downsampling (3 layers) → 25x25 grid
+_GRID_SIZE = _PADDED_SIZE // _PATCH_STRIDE  # 25
+
 
 class SCTokenProcessor(torch.nn.Module):
 
     def __init__(
         self,
         motion_dict_file: str,
+        map_data_dir: str,
         agent_token_sampling: DictConfig,
     ) -> None:
         super().__init__()
         self.agent_token_sampling = agent_token_sampling
+        self.map_data_dir = map_data_dir
+        self._map_cache: Dict[str, Dict[str, Tensor]] = {}
         self.shift = 8
         self.current_frame_idx = 16
         self.dt = 1.0 / 16.0  # 16 fps
@@ -47,13 +57,84 @@ class SCTokenProcessor(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        tokenized_map = self._tokenize_map_dummy(data)
+        tokenized_map = self._tokenize_map(data)
         tokenized_agent = self.tokenize_agent(data)
         return tokenized_map, tokenized_agent
 
-    def _tokenize_map_dummy(self, data: HeteroData) -> Dict[str, Tensor]:
-        """Return an empty map dict. Map support is deferred to phase 2."""
-        return {}
+    # ------------------------------------------------------------------
+    # Map tokenization
+    # ------------------------------------------------------------------
+
+    def _load_and_preprocess_map(self, map_name: str) -> Dict[str, Tensor]:
+        """Load static map HDF5, preprocess, and cache. Only 7 maps total."""
+        if map_name in self._map_cache:
+            return self._map_cache[map_name]
+
+        path = os.path.join(self.map_data_dir, f"{map_name}.h5")
+        with h5py.File(path, "r") as f:
+            pathing = torch.from_numpy(f["pathing_grid"][:].astype("float32"))  # [H, W]
+            height = torch.from_numpy(f["height_map"][:].astype("float32"))     # [H, W]
+
+        # Normalize: pathing stays 0/1, height to [-1, 1]
+        height = height / 255.0 * 2.0 - 1.0
+        grid = torch.stack([pathing, height], dim=0)  # [2, H, W]
+        H, W = grid.shape[1], grid.shape[2]
+
+        # Valid mask before padding (marks original area)
+        valid_2d = torch.ones(H, W, dtype=torch.bool)
+
+        # Pad to (_PADDED_SIZE, _PADDED_SIZE)
+        grid = F.pad(grid, (0, _PADDED_SIZE - W, 0, _PADDED_SIZE - H), value=0.0)
+        valid_2d = F.pad(valid_2d, (0, _PADDED_SIZE - W, 0, _PADDED_SIZE - H), value=False)
+
+        # Per-patch valid mask (25x25): valid if any cell in the 8x8 patch is in original area
+        valid_patches = valid_2d.unfold(0, _PATCH_STRIDE, _PATCH_STRIDE).unfold(
+            1, _PATCH_STRIDE, _PATCH_STRIDE
+        )  # [25, 25, 8, 8]
+        valid_mask = valid_patches.reshape(_GRID_SIZE * _GRID_SIZE, -1).any(dim=1)  # [625]
+
+        # Patch center positions in game coordinates: (col→X, row→Y)
+        row_idx = torch.arange(_GRID_SIZE, dtype=torch.float32).unsqueeze(1).expand(_GRID_SIZE, _GRID_SIZE)
+        col_idx = torch.arange(_GRID_SIZE, dtype=torch.float32).unsqueeze(0).expand(_GRID_SIZE, _GRID_SIZE)
+        position = torch.stack([
+            col_idx.reshape(-1) * _PATCH_STRIDE + _PATCH_STRIDE / 2.0,  # X
+            row_idx.reshape(-1) * _PATCH_STRIDE + _PATCH_STRIDE / 2.0,  # Y
+        ], dim=-1)  # [625, 2]
+
+        result = {"map_grid": grid, "position": position, "valid_mask": valid_mask}
+        self._map_cache[map_name] = result
+        return result
+
+    def _tokenize_map(self, data: HeteroData) -> Dict[str, Tensor]:
+        """Load and batch static map data for all scenarios in the batch."""
+        device = data["agent"]["position"].device
+
+        # data["map_name"] is a list of strings after PyG batching
+        map_names: List[str] = data["map_name"]
+        if isinstance(map_names, str):
+            map_names = [map_names]
+
+        batch_size = len(map_names)
+        n_patches = _GRID_SIZE * _GRID_SIZE  # 625
+
+        grids = []
+        positions = []
+        valid_masks = []
+        batch_indices = []
+
+        for i, name in enumerate(map_names):
+            m = self._load_and_preprocess_map(name)
+            grids.append(m["map_grid"])
+            positions.append(m["position"])
+            valid_masks.append(m["valid_mask"])
+            batch_indices.append(torch.full((n_patches,), i, dtype=torch.long))
+
+        return {
+            "map_grid": torch.stack(grids, dim=0).to(device),          # [B, 2, 200, 200]
+            "position": torch.cat(positions, dim=0).to(device),        # [B*625, 2]
+            "valid_mask": torch.cat(valid_masks, dim=0).to(device),    # [B*625]
+            "batch": torch.cat(batch_indices, dim=0).to(device),       # [B*625]
+        }
 
     def tokenize_agent(self, data: HeteroData) -> Dict[str, Tensor]:
         valid = data["agent"]["valid_mask"].clone()  # [n_agent, T]

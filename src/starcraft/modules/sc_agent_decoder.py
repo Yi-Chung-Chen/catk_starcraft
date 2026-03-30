@@ -1,6 +1,6 @@
 """StarCraft agent decoder.
 
-No map-to-agent attention. Unified token embedding. Contour-based rollout.
+Map-to-agent + agent-to-agent attention. Unified token embedding. Contour-based rollout.
 """
 
 from typing import Dict, Optional
@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch_cluster import radius_graph
+from torch_cluster import radius, radius_graph
 from torch_geometric.utils import dense_to_sparse, subgraph
 
 from src.smart.layers import MLPLayer
@@ -27,6 +27,7 @@ class SCAgentDecoder(nn.Module):
         num_historical_steps: int,
         num_future_steps: int,
         time_span: Optional[int],
+        pl2a_radius: float,
         a2a_radius: float,
         num_freq_bands: int,
         num_layers: int,
@@ -41,6 +42,7 @@ class SCAgentDecoder(nn.Module):
         self.num_historical_steps = num_historical_steps
         self.num_future_steps = num_future_steps
         self.time_span = time_span if time_span is not None else num_historical_steps
+        self.pl2a_radius = pl2a_radius
         self.a2a_radius = a2a_radius
         self.num_layers = num_layers
         self.shift = 8
@@ -48,6 +50,7 @@ class SCAgentDecoder(nn.Module):
 
         input_dim_x_a = 2
         input_dim_r_t = 4
+        input_dim_r_pl2a = 3  # [distance, angle, rel_orient]
         input_dim_r_a2a = 3
         input_dim_token = 8  # [4 corners * 2 coords], flattened endpoint contour
 
@@ -61,6 +64,11 @@ class SCAgentDecoder(nn.Module):
         )
         self.r_t_emb = FourierEmbedding(
             input_dim=input_dim_r_t,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
+        self.r_pl2a_emb = FourierEmbedding(
+            input_dim=input_dim_r_pl2a,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -83,6 +91,19 @@ class SCAgentDecoder(nn.Module):
                     head_dim=head_dim,
                     dropout=dropout,
                     bipartite=False,
+                    has_pos_emb=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.pl2a_attn_layers = nn.ModuleList(
+            [
+                AttentionLayer(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    dropout=dropout,
+                    bipartite=True,
                     has_pos_emb=True,
                 )
                 for _ in range(num_layers)
@@ -246,6 +267,56 @@ class SCAgentDecoder(nn.Module):
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
         return edge_index_a2a, r_a2a
 
+    def build_map2agent_edge(
+        self,
+        pos_pl,          # [n_pl, 2]
+        orient_pl,       # [n_pl]
+        valid_pl,        # [n_pl] bool — patch validity (False for padding)
+        pos_a,           # [n_agent, n_step, 2]
+        head_a,          # [n_agent, n_step]
+        head_vector_a,   # [n_agent, n_step, 2]
+        mask,            # [n_agent, n_step]
+        batch_s,         # [n_agent*n_step]
+        batch_pl,        # [n_pl*n_step]
+    ):
+        n_step = pos_a.shape[1]
+        mask_pl2a = mask.transpose(0, 1).reshape(-1)
+        pos_s = pos_a.transpose(0, 1).flatten(0, 1)
+        head_s = head_a.transpose(0, 1).reshape(-1)
+        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+        pos_pl = pos_pl.repeat(n_step, 1)
+        orient_pl = orient_pl.repeat(n_step)
+        valid_pl_rep = valid_pl.repeat(n_step)
+        edge_index_pl2a = radius(
+            x=pos_s[:, :2],
+            y=pos_pl[:, :2],
+            r=self.pl2a_radius,
+            batch_x=batch_s,
+            batch_y=batch_pl,
+            max_num_neighbors=300,
+        )
+        # Filter: agent must be valid AND patch must be valid (non-padded)
+        edge_index_pl2a = edge_index_pl2a[
+            :, mask_pl2a[edge_index_pl2a[1]] & valid_pl_rep[edge_index_pl2a[0]]
+        ]
+        rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
+        rel_orient_pl2a = wrap_angle(
+            orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
+        )
+        r_pl2a = torch.stack(
+            [
+                torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_s[edge_index_pl2a[1]],
+                    nbr_vector=rel_pos_pl2a[:, :2],
+                ),
+                rel_orient_pl2a,
+            ],
+            dim=-1,
+        )
+        r_pl2a = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        return edge_index_pl2a, r_pl2a
+
     def forward(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -285,11 +356,33 @@ class SCAgentDecoder(nn.Module):
             visible_status=tokenized_agent["visible_status"],
         )
 
-        # Attention layers: temporal + agent-to-agent (no map-to-agent)
+        batch_pl = torch.cat(
+            [
+                map_feature["batch"] + tokenized_agent["num_graphs"] * t
+                for t in range(n_step)
+            ],
+            dim=0,
+        )
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            valid_pl=map_feature["valid_mask"],
+            pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
+            mask=mask, batch_s=batch_s, batch_pl=batch_pl,
+        )
+
+        feat_map = (
+            map_feature["pt_token"].unsqueeze(0).expand(n_step, -1, -1).flatten(0, 1)
+        )
+
+        # Attention layers: temporal + map-to-agent + agent-to-agent
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
             feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
             feat_a = feat_a.view(n_agent, n_step, -1).transpose(0, 1).flatten(0, 1)
+            feat_a = self.pl2a_attn_layers[i](
+                (feat_map, feat_a), r_pl2a, edge_index_pl2a
+            )
             feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
 
@@ -369,6 +462,13 @@ class SCAgentDecoder(nn.Module):
                     ],
                     dim=0,
                 )
+                batch_pl = torch.cat(
+                    [
+                        map_feature["batch"] + tokenized_agent["num_graphs"] * s
+                        for s in range(hist_step)
+                    ],
+                    dim=0,
+                )
                 inference_mask = pred_valid[:, :n_step]
                 edge_index_t, r_t = self.build_temporal_edge(
                     pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
@@ -377,6 +477,7 @@ class SCAgentDecoder(nn.Module):
             else:
                 hist_step = 1
                 batch_s = tokenized_agent["batch"]
+                batch_pl = map_feature["batch"]
                 inference_mask = pred_valid[:, :n_step].clone()
                 inference_mask[:, :-1] = False
                 edge_index_t, r_t = self.build_temporal_edge(
@@ -386,6 +487,17 @@ class SCAgentDecoder(nn.Module):
                 )
                 edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
 
+            edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+                pos_pl=map_feature["position"],
+                orient_pl=map_feature["orientation"],
+                valid_pl=map_feature["valid_mask"],
+                pos_a=pos_a[:, -hist_step:],
+                head_a=head_a[:, -hist_step:],
+                head_vector_a=head_vector_a[:, -hist_step:],
+                mask=inference_mask[:, -hist_step:],
+                batch_s=batch_s,
+                batch_pl=batch_pl,
+            )
             edge_index_a2a, r_a2a = self.build_interaction_edge(
                 pos_a=pos_a[:, -hist_step:],
                 head_a=head_a[:, -hist_step:],
@@ -404,6 +516,16 @@ class SCAgentDecoder(nn.Module):
                         _feat_temporal.flatten(0, 1), r_t, edge_index_t
                     ).view(n_agent, n_step, -1)
                     _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
+
+                    _feat_map = (
+                        map_feature["pt_token"]
+                        .unsqueeze(0)
+                        .expand(hist_step, -1, -1)
+                        .flatten(0, 1)
+                    )
+                    _feat_temporal = self.pl2a_attn_layers[i](
+                        (_feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
+                    )
                     _feat_temporal = self.a2a_attn_layers[i](
                         _feat_temporal, r_a2a, edge_index_a2a
                     )
@@ -415,6 +537,9 @@ class SCAgentDecoder(nn.Module):
                     feat_a_now = self.t_attn_layers[i](
                         (_feat_temporal.flatten(0, 1), _feat_temporal[:, -1]),
                         r_t, edge_index_t,
+                    )
+                    feat_a_now = self.pl2a_attn_layers[i](
+                        (map_feature["pt_token"], feat_a_now), r_pl2a, edge_index_pl2a
                     )
                     feat_a_now = self.a2a_attn_layers[i](
                         feat_a_now, r_a2a, edge_index_a2a
