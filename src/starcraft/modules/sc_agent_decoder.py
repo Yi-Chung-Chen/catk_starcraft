@@ -434,7 +434,7 @@ class SCAgentDecoder(nn.Module):
         # Token data for rollout
         token_traj_all = tokenized_agent["token_traj_all"]  # [n_token, 9, 4, 2]
         token_traj = tokenized_agent["token_traj"]  # [n_token, 4, 2]
-        token_agent_shape = tokenized_agent["token_agent_shape"]  # [n_agent, 2]
+        token_agent_shape = tokenized_agent["token_agent_shape"]  # [n_agent, 2] (for threshold)
 
         if not self.training:
             pred_traj_native = torch.zeros(
@@ -563,12 +563,11 @@ class SCAgentDecoder(nn.Module):
                     pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
                     head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
                     valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
-                    token_agent_shape=token_agent_shape,
                 )
             )  # next_token_traj_all: [n_agent, 9, 4, 2] in local coords
 
             # next_token_action from local endpoint (before global transform)
-            diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 3]
+            diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 2]  # front - back
             next_token_action_list.append(
                 torch.cat(
                     [
@@ -592,14 +591,14 @@ class SCAgentDecoder(nn.Module):
                 pred_traj_native[:, t * self.shift : (t + 1) * self.shift] = (
                     token_traj_global[:, 1:].mean(2)
                 )
-                diff_xy_sub = token_traj_global[:, 1:, 0] - token_traj_global[:, 1:, 3]
+                diff_xy_sub = token_traj_global[:, 1:, 0] - token_traj_global[:, 1:, 2]  # front - back
                 pred_head_native[:, t * self.shift : (t + 1) * self.shift] = (
                     torch.atan2(diff_xy_sub[:, :, 1], diff_xy_sub[:, :, 0])
                 )
 
             # Extract next_pos/next_head from global endpoint
             next_pos = token_traj_global[:, -1].mean(dim=1)  # [n_agent, 2]
-            diff_xy_next = token_traj_global[:, -1, 0] - token_traj_global[:, -1, 3]
+            diff_xy_next = token_traj_global[:, -1, 0] - token_traj_global[:, -1, 2]  # front - back
             next_head = torch.arctan2(diff_xy_next[:, 1], diff_xy_next[:, 0])
 
             pred_idx[:, n_step] = next_token_idx

@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributions import Categorical
 
-from src.smart.utils import cal_polygon_contour, transform_to_global, wrap_angle
+from src.smart.utils import cal_circular_contour, transform_to_global, wrap_angle
 
 
 @torch.no_grad()
@@ -21,9 +21,8 @@ def sample_next_token_traj_contour(
     pos_next_gt: Tensor,  # [n_agent, 2]
     head_next_gt: Tensor,  # [n_agent]
     valid_next_gt: Tensor,  # [n_agent]
-    token_agent_shape: Tensor,  # [n_agent, 2]
 ) -> Tuple[Tensor, Tensor]:
-    """Sample next token using contour-based distance.
+    """Sample next token using circular contour distance (radius=0.5).
 
     Returns:
         next_token_idx: [n_agent]
@@ -41,10 +40,8 @@ def sample_next_token_traj_contour(
             logits, sampling_scheme.num_k, dim=-1, sorted=False
         )
         if sampling_scheme.criterium == "topk_prob_sampled_with_dist":
-            # GT contour: [n_agent, 4, 2] in global coord
-            gt_contour = cal_polygon_contour(
-                pos_next_gt, head_next_gt, token_agent_shape
-            )
+            # GT contour: [n_agent, 4, 2] in global coord (circular, radius=0.5)
+            gt_contour = cal_circular_contour(pos_next_gt, head_next_gt)
             gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
 
             # Top-K token contours from shared vocab: [n_agent, K, 4, 2]

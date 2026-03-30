@@ -15,7 +15,7 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
-from src.smart.utils import cal_polygon_contour, transform_to_global, transform_to_local, wrap_angle
+from src.smart.utils import cal_circular_contour, transform_to_global, transform_to_local, wrap_angle
 
 _PADDED_SIZE = 200  # all maps padded to 200x200
 _PATCH_STRIDE = 8   # CNN stride-8 downsampling (3 layers) → 25x25 grid
@@ -185,7 +185,6 @@ class SCTokenProcessor(torch.nn.Module):
             valid=valid,
             pos=pos,
             heading=heading,
-            agent_shape=agent_shape,
             token_traj=self.agent_token_endpoint,  # [n_token, 4, 2]
         )
         tokenized_agent.update(token_dict)
@@ -196,10 +195,9 @@ class SCTokenProcessor(torch.nn.Module):
         valid: Tensor,  # [n_agent, T]
         pos: Tensor,  # [n_agent, T, 2]
         heading: Tensor,  # [n_agent, T]
-        agent_shape: Tensor,  # [n_agent, 2]
         token_traj: Tensor,  # [n_token, 4, 2]
     ) -> Dict[str, Tensor]:
-        """Contour-based token matching following SMART pattern."""
+        """Contour-based token matching using circular contour (radius=0.5)."""
         num_k = self.agent_token_sampling.num_k if self.training else 1
         n_agent, n_step = valid.shape
         range_a = torch.arange(n_agent, device=valid.device)
@@ -225,8 +223,8 @@ class SCTokenProcessor(torch.nn.Module):
             _invalid = ~_valid
             out["valid_mask"].append(_valid)
 
-            # GT contour: [n_agent, 4, 2] in global coord
-            gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
+            # GT contour: [n_agent, 4, 2] in global coord (circular, radius=0.5)
+            gt_contour = cal_circular_contour(pos[:, i], heading[:, i])
             gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
 
             # Expand shared vocab for transform_to_global
@@ -248,7 +246,7 @@ class SCTokenProcessor(torch.nn.Module):
             token_contour_gt = token_world_gt[range_a, token_idx_gt]  # [n_agent, 4, 2]
 
             prev_head = heading[:, i].clone()
-            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
+            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 2]  # front - back
             prev_head[_valid] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid]
             prev_pos = pos[:, i].clone()
             prev_pos[_valid] = token_contour_gt.mean(1)[_valid]
@@ -283,7 +281,7 @@ class SCTokenProcessor(torch.nn.Module):
                 token_contour_s = token_world_sample[range_a, token_idx_s]
 
                 prev_head_sample = heading[:, i].clone()
-                dxy = token_contour_s[:, 0] - token_contour_s[:, 3]
+                dxy = token_contour_s[:, 0] - token_contour_s[:, 2]  # front - back
                 prev_head_sample[_valid] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid]
                 prev_pos_sample = pos[:, i].clone()
                 prev_pos_sample[_valid] = token_contour_s.mean(1)[_valid]

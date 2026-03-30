@@ -58,6 +58,26 @@ def cal_polygon_contour(
     return polygon_contour
 
 
+_CIRCULAR_OFFSETS = torch.tensor([0.0, torch.pi / 2, torch.pi, 3 * torch.pi / 2])
+
+
+def cal_circular_contour(
+    pos: Tensor,  # [..., 2]
+    head: Tensor,  # [...]
+    radius: float = 0.5,
+) -> Tensor:  # [..., 4, 2]
+    """Circular contour: 4 points at heading + [0, π/2, π, 3π/2].
+
+    Matches build_motion_dictionary.py compute_contours().
+    Point order: front, left, back, right (counter-clockwise from heading).
+    """
+    offsets = _CIRCULAR_OFFSETS.to(device=head.device, dtype=head.dtype)
+    angles = head.unsqueeze(-1) + offsets  # [..., 4]
+    cx = pos[..., 0:1] + radius * angles.cos()  # [..., 4]
+    cy = pos[..., 1:2] + radius * angles.sin()  # [..., 4]
+    return torch.stack([cx, cy], dim=-1)  # [..., 4, 2]
+
+
 def transform_to_global(
     pos_local: Tensor,  # [n_agent, n_step, 2]
     head_local: Optional[Tensor],  # [n_agent, n_step]
