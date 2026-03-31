@@ -45,7 +45,7 @@ class SCCrossEntropy(Metric):
         gt_pos: Tensor,  # [n_agent, 18, 2]
         gt_head: Tensor,  # [n_agent, 18]
         gt_valid: Tensor,  # [n_agent, 18]
-        token_agent_shape: Tensor,  # [n_agent, 2]
+        token_agent_shape: Tensor,  # [n_agent, 1]
         token_traj: Tensor,  # [n_token, 4, 2]
         train_mask: Optional[Tensor] = None,
         next_token_action: Optional[Tensor] = None,
@@ -58,7 +58,7 @@ class SCCrossEntropy(Metric):
 
         if self.gt_thresh_scale_length > 0:
             dist = torch.norm(pred_pos - gt_pos, dim=-1)
-            _thresh = token_agent_shape[:, 1] * self.gt_thresh_scale_length
+            _thresh = token_agent_shape[:, 0] * self.gt_thresh_scale_length
             gt_valid = gt_valid & (dist < _thresh.unsqueeze(1))
 
         euclidean_target, euclidean_target_valid = get_euclidean_targets(

@@ -66,6 +66,10 @@ class SCDataset(Dataset):
             is_flying = rep["is_flying"][:].astype(bool)  # (T, N)
             is_burrowed = rep["is_burrowed"][:].astype(bool)  # (T, N)
             is_carried = rep["is_carried"][:].astype(bool)  # (T, N)
+            health = rep["health"][:].astype(np.float32)  # (T, N)
+            health_max = rep["health_max"][:].astype(np.float32)  # (T, N)
+            shield = rep["shield"][:].astype(np.float32)  # (T, N)
+            energy = rep["energy"][:].astype(np.float32)  # (T, N)
 
             # Dynamic map data: creep at current frame
             map_frame_skip = int(f.attrs["map_frame_skip"])
@@ -96,6 +100,10 @@ class SCDataset(Dataset):
         is_flying = is_flying[:, keep_idx]  # (T, N')
         is_burrowed = is_burrowed[:, keep_idx]  # (T, N')
         is_carried = is_carried[:, keep_idx]  # (T, N')
+        health = health[:, keep_idx]  # (T, N')
+        health_max = health_max[:, keep_idx]  # (T, N')
+        shield = shield[:, keep_idx]  # (T, N')
+        energy = energy[:, keep_idx]  # (T, N')
         unit_tag = unit_tag[keep_idx]  # (N',)
         unit_owner = unit_owner[keep_idx]  # (N',)
         N = len(keep_idx)
@@ -111,12 +119,9 @@ class SCDataset(Dataset):
         type_at_current = unit_type[min(CURRENT_FRAME_IDX, T - 1)]  # (N,)
         agent_type = torch.from_numpy(remap_unit_type(type_at_current)).to(torch.long)
 
-        # Shape: [2*radius, 2*radius, 0] at current_frame_idx
+        # Radius at current_frame_idx
         r = radius[min(CURRENT_FRAME_IDX, T - 1)]  # (N,)
-        diameter = 2.0 * r
-        shape = torch.from_numpy(
-            np.stack([diameter, diameter, np.zeros_like(diameter)], axis=-1)
-        ).float()  # (N, 3)
+        radius_t = torch.from_numpy(r).float()  # (N,)
 
         # Unit state at current frame: 0=grounded, 1=flying, 2=burrowed, 3=carried
         t_state = min(CURRENT_FRAME_IDX, T - 1)
@@ -129,6 +134,16 @@ class SCDataset(Dataset):
         unit_state[b] = 2
         unit_state[c] = 3
         unit_state_t = torch.from_numpy(unit_state)  # (N,)
+
+        # Unit vitals at current frame: [health_frac, shield_norm, energy_norm]
+        t_v = min(CURRENT_FRAME_IDX, T - 1)
+        h, h_max = health[t_v], health_max[t_v]
+        health_frac = np.divide(h, h_max, out=np.zeros_like(h), where=h_max > 0)
+        shield_norm = shield[t_v] / 1000.0
+        energy_norm = energy[t_v] / 200.0
+        unit_vitals = torch.from_numpy(
+            np.stack([health_frac, shield_norm, energy_norm], axis=-1)
+        ).float()  # (N, 3)
 
         # Role: all False (no ego concept)
         role = torch.zeros(N, 3, dtype=torch.bool)
@@ -162,11 +177,12 @@ class SCDataset(Dataset):
                 "heading": heading_t,
                 "id": agent_id,
                 "type": agent_type,
-                "shape": shape,
+                "radius": radius_t,
                 "role": role,
                 "owner": owner_t,
                 "visible_status": visible_status_t,
                 "unit_state": unit_state_t,
+                "unit_vitals": unit_vitals,
             },
         }
         return data

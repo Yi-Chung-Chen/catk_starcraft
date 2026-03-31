@@ -153,18 +153,21 @@ class SCTokenProcessor(torch.nn.Module):
         # Stationary-fill extrapolation (no velocity needed)
         valid, pos, heading = self._extrapolate_stationary(valid, pos, heading)
 
-        agent_shape = data["agent"]["shape"][:, :2]  # [n_agent, 2]
+        radius = data["agent"]["radius"]  # [n_agent]
 
         tokenized_agent = {
             "num_graphs": data.num_graphs,
             "type": data["agent"]["type"],
-            "shape": data["agent"]["shape"],
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent], all False for SC
-            "token_agent_shape": agent_shape,  # [n_agent, 2]
+            "token_agent_shape": radius.unsqueeze(-1),  # [n_agent, 1]
             "batch": data["agent"]["batch"],
             # Ownership and visibility for fog-of-war edge filtering
             "owner": data["agent"]["owner"],  # [n_agent]
             "unit_state": data["agent"]["unit_state"],  # [n_agent]
+            "unit_props": torch.cat([
+                radius.unsqueeze(-1),            # [n_agent, 1]
+                data["agent"]["unit_vitals"],     # [n_agent, 3] health, shield, energy
+            ], dim=-1),  # [n_agent, 4]
             "visible_status": data["agent"]["visible_status"][:, self.shift :: self.shift],  # [n_agent, 18]
             # Token vocabulary (shared across all agents/types)
             "token_traj_all": self.agent_token_all,  # [n_token, 9, 4, 2]

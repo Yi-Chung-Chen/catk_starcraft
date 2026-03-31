@@ -55,8 +55,8 @@ class SCAgentDecoder(nn.Module):
         input_dim_token = 8  # [4 corners * 2 coords], flattened endpoint contour
 
         self.type_a_emb = nn.Embedding(NUM_UNIT_TYPES, hidden_dim)
-        self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
         self.unit_state_emb = nn.Embedding(4, hidden_dim)  # grounded/flying/burrowed/carried
+        self.unit_props_emb = MLPLayer(4, hidden_dim, hidden_dim)  # radius, health, shield, energy
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -135,8 +135,8 @@ class SCAgentDecoder(nn.Module):
         pos_a,  # [n_agent, n_step, 2]
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
-        agent_shape,  # [n_agent, 3]
         unit_state,  # [n_agent]
+        unit_props,  # [n_agent, 4] (radius, health, shield, energy)
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -163,8 +163,8 @@ class SCAgentDecoder(nn.Module):
         )  # [n_agent, n_step, 2]
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
-            self.shape_emb(agent_shape),
             self.unit_state_emb(unit_state.long()),
+            self.unit_props_emb(unit_props),
         ]
 
         x_a = self.x_a_emb(
@@ -337,8 +337,8 @@ class SCAgentDecoder(nn.Module):
             pos_a=pos_a,
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
-            agent_shape=tokenized_agent["shape"],
             unit_state=tokenized_agent["unit_state"],
+            unit_props=tokenized_agent["unit_props"],
         )
 
         edge_index_t, r_t = self.build_temporal_edge(
@@ -430,8 +430,8 @@ class SCAgentDecoder(nn.Module):
                 pos_a=pos_a,
                 head_vector_a=head_vector_a,
                 agent_type=tokenized_agent["type"],
-                agent_shape=tokenized_agent["shape"],
                 unit_state=tokenized_agent["unit_state"],
+                unit_props=tokenized_agent["unit_props"],
                 inference=True,
             )
         )
@@ -439,7 +439,7 @@ class SCAgentDecoder(nn.Module):
         # Token data for rollout
         token_traj_all = tokenized_agent["token_traj_all"]  # [n_token, 9, 4, 2]
         token_traj = tokenized_agent["token_traj"]  # [n_token, 4, 2]
-        token_agent_shape = tokenized_agent["token_agent_shape"]  # [n_agent, 2] (for threshold)
+        token_agent_shape = tokenized_agent["token_agent_shape"]  # [n_agent, 1] (radius)
 
         if not self.training:
             pred_traj_native = torch.zeros(
