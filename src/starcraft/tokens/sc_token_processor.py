@@ -164,6 +164,7 @@ class SCTokenProcessor(torch.nn.Module):
             "batch": data["agent"]["batch"],
             # Ownership and visibility for fog-of-war edge filtering
             "owner": data["agent"]["owner"],  # [n_agent]
+            "unit_state": data["agent"]["unit_state"],  # [n_agent]
             "visible_status": data["agent"]["visible_status"][:, self.shift :: self.shift],  # [n_agent, 18]
             # Token vocabulary (shared across all agents/types)
             "token_traj_all": self.agent_token_all,  # [n_token, 9, 4, 2]

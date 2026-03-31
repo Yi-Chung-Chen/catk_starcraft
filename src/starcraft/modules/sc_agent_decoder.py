@@ -56,6 +56,7 @@ class SCAgentDecoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(NUM_UNIT_TYPES, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
+        self.unit_state_emb = nn.Embedding(4, hidden_dim)  # grounded/flying/burrowed/carried
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -135,6 +136,7 @@ class SCAgentDecoder(nn.Module):
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
         agent_shape,  # [n_agent, 3]
+        unit_state,  # [n_agent]
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -162,6 +164,7 @@ class SCAgentDecoder(nn.Module):
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
             self.shape_emb(agent_shape),
+            self.unit_state_emb(unit_state.long()),
         ]
 
         x_a = self.x_a_emb(
@@ -335,6 +338,7 @@ class SCAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            unit_state=tokenized_agent["unit_state"],
         )
 
         edge_index_t, r_t = self.build_temporal_edge(
@@ -427,6 +431,7 @@ class SCAgentDecoder(nn.Module):
                 head_vector_a=head_vector_a,
                 agent_type=tokenized_agent["type"],
                 agent_shape=tokenized_agent["shape"],
+                unit_state=tokenized_agent["unit_state"],
                 inference=True,
             )
         )
