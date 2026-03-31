@@ -5,7 +5,7 @@ CAT-K training pipeline.
 """
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import h5py
 import numpy as np
@@ -29,14 +29,21 @@ class SCDataset(Dataset):
         dataset_root: str,
         split: str,
         transform: Optional[Callable] = None,
+        map_names: Optional[List[str]] = None,
     ) -> None:
         dataset_root = Path(dataset_root)
         manifest_path = dataset_root / "manifests" / f"{split}_manifest.txt"
         with open(manifest_path) as f:
             rel_paths = [line.strip() for line in f if line.strip()]
         self._file_paths = [str(dataset_root / p) for p in rel_paths]
+        if map_names is not None:
+            map_set = set(map_names)
+            self._file_paths = [
+                p for p in self._file_paths if Path(p).parent.name in map_set
+            ]
         self._num_samples = len(self._file_paths)
-        log.info(f"SCDataset [{split}]: {self._num_samples} scenarios")
+        log.info(f"SCDataset [{split}]: {self._num_samples} scenarios"
+                 f" (maps: {map_names if map_names else 'all'})")
         super().__init__(transform=transform, pre_transform=None, pre_filter=None)
 
     def len(self) -> int:

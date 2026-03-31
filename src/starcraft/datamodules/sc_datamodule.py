@@ -1,6 +1,6 @@
 """StarCraft Motion DataModule."""
 
-from typing import Optional
+from typing import List, Optional
 
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
@@ -24,6 +24,9 @@ class SCDataModule(LightningDataModule):
         persistent_workers: bool,
         train_max_num: int,
         min_future_alive: int = 8,
+        train_map_names: Optional[List[str]] = None,
+        val_map_names: Optional[List[str]] = None,
+        test_map_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self.dataset_root = dataset_root
@@ -36,6 +39,9 @@ class SCDataModule(LightningDataModule):
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_max_num = train_max_num
         self.min_future_alive = min_future_alive
+        self.train_map_names = train_map_names
+        self.val_map_names = val_map_names
+        self.test_map_names = test_map_names
 
         self.train_transform = SCTargetBuilderTrain(train_max_num, min_future_alive)
         self.val_transform = SCTargetBuilderVal()
@@ -44,18 +50,22 @@ class SCDataModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
             self.train_dataset = SCDataset(
-                self.dataset_root, "train", transform=self.train_transform
+                self.dataset_root, "train", transform=self.train_transform,
+                map_names=self.train_map_names,
             )
             self.val_dataset = SCDataset(
-                self.dataset_root, "val", transform=self.val_transform
+                self.dataset_root, "val", transform=self.val_transform,
+                map_names=self.val_map_names,
             )
         elif stage == "validate":
             self.val_dataset = SCDataset(
-                self.dataset_root, "val", transform=self.val_transform
+                self.dataset_root, "val", transform=self.val_transform,
+                map_names=self.val_map_names,
             )
         elif stage == "test":
             self.test_dataset = SCDataset(
-                self.dataset_root, "test", transform=self.test_transform
+                self.dataset_root, "test", transform=self.test_transform,
+                map_names=self.test_map_names,
             )
         else:
             raise ValueError(f"{stage} should be one of [fit, validate, test]")

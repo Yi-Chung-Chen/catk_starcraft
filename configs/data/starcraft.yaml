@@ -9,3 +9,16 @@ pin_memory: true
 persistent_workers: true
 train_max_num: 64
 min_future_alive: 8
+train_map_names:
+  - Abyssal_Reef_LE
+  - Acolyte_LE
+  - Ascension_to_Aiur_LE
+  - Catallena_LE_(Void)
+  - Interloper_LE
+val_map_names:
+  - Abyssal_Reef_LE
+  - Acolyte_LE
+  - Ascension_to_Aiur_LE
+  - Catallena_LE_(Void)
+  - Interloper_LE
+test_map_names: null
