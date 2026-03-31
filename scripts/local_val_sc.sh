@@ -5,7 +5,8 @@ export TF_CPP_MIN_LOG_LEVEL=2
 
 MY_EXPERIMENT="sc_pre_bc"
 MY_TASK_NAME="sc_closed_val_eval"
-MY_CKPT_PATH="logs/sc_pre_bc-debug/runs/2026-03-26_00-54-15/checkpoints/last.ckpt"
+# MY_CKPT_PATH="logs/sc_pre_bc-debug/runs/2026-03-26_00-54-15/checkpoints/last.ckpt"
+MY_CKPT_PATH="logs/sc_pre_bc-debug/runs/2026-03-30_22-56-07/checkpoints/last.ckpt"
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate catk
