@@ -32,7 +32,8 @@ torchrun --nproc_per_node=gpu \
   data.train_batch_size=8 \
   data.val_batch_size=8 \
   data.test_batch_size=8 \
-  trainer.max_epochs=10
+  trainer.max_epochs=10 \
+  ckpt_path=logs/sc_pre_bc-debug/runs/2026-03-31_16-46-54/checkpoints/last.ckpt
 
 # Multi-GPU DDP (uncomment for multi-GPU or multi-node):
 # torchrun \
