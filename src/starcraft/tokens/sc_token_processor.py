@@ -169,6 +169,7 @@ class SCTokenProcessor(torch.nn.Module):
                 data["agent"]["unit_vitals"],     # [n_agent, 3] health, shield, energy
             ], dim=-1),  # [n_agent, 4]
             "visible_status": data["agent"]["visible_status"][:, self.shift :: self.shift],  # [n_agent, 18]
+            "player_start_loc": data["player_start_loc"].view(data.num_graphs, 2, 2),  # [B, 2, 2]
             # Token vocabulary (shared across all agents/types)
             "token_traj_all": self.agent_token_all,  # [n_token, 9, 4, 2]
             "token_traj": self.agent_token_endpoint,  # [n_token, 4, 2]

@@ -38,6 +38,7 @@ model_config:
     time_span: 48
     num_historical_steps: 17
     num_future_steps: 128
+    num_concepts: 16
   training_loss:
     use_gt_raw: true
     gt_thresh_scale_length: -1.0

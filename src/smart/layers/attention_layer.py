@@ -18,12 +18,14 @@ class AttentionLayer(MessagePassing):
         dropout: float,
         bipartite: bool,
         has_pos_emb: bool,
+        has_pos_emb_q: bool = False,
         **kwargs
     ) -> None:
         super(AttentionLayer, self).__init__(aggr="add", node_dim=0, **kwargs)
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.has_pos_emb = has_pos_emb
+        self.has_pos_emb_q = has_pos_emb_q
         self.scale = head_dim**-0.5
 
         self.to_q = nn.Linear(hidden_dim, head_dim * num_heads)
@@ -32,6 +34,9 @@ class AttentionLayer(MessagePassing):
         if has_pos_emb:
             self.to_k_r = nn.Linear(hidden_dim, head_dim * num_heads, bias=False)
             self.to_v_r = nn.Linear(hidden_dim, head_dim * num_heads)
+        if has_pos_emb_q:
+            self.to_q_r = nn.Linear(hidden_dim, head_dim * num_heads, bias=False)
+            self.attn_prenorm_q_r = nn.LayerNorm(hidden_dim)
         self.to_s = nn.Linear(hidden_dim, head_dim * num_heads)
         self.to_g = nn.Linear(head_dim * num_heads + hidden_dim, head_dim * num_heads)
         self.to_out = nn.Linear(head_dim * num_heads, hidden_dim)
@@ -60,6 +65,7 @@ class AttentionLayer(MessagePassing):
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         r: Optional[torch.Tensor],
         edge_index: torch.Tensor,
+        r_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
             x_src = x_dst = self.attn_prenorm_x_src(x)
@@ -70,7 +76,7 @@ class AttentionLayer(MessagePassing):
             x = x[1]
         if self.has_pos_emb and r is not None:
             r = self.attn_prenorm_r(r)
-        x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index))
+        x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index, r_q))
         x = x + self.ff_postnorm(self._ff_block(self.ff_prenorm(x)))
         return x
 
@@ -103,8 +109,13 @@ class AttentionLayer(MessagePassing):
         x_dst: torch.Tensor,
         r: Optional[torch.Tensor],
         edge_index: torch.Tensor,
+        r_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q = self.to_q(x_dst).view(-1, self.num_heads, self.head_dim)
+        if self.has_pos_emb_q and r_q is not None:
+            q = q + self.to_q_r(self.attn_prenorm_q_r(r_q)).view(
+                -1, self.num_heads, self.head_dim
+            )
         k = self.to_k(x_src).view(-1, self.num_heads, self.head_dim)
         v = self.to_v(x_src).view(-1, self.num_heads, self.head_dim)
         agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r)

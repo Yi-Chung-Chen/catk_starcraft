@@ -115,6 +115,9 @@ class SCDataset(Dataset):
         unit_owner = unit_owner[keep_idx]  # (N',)
         N = len(keep_idx)
 
+        # TODO: read player starting locations from h5 file once available
+        player_start_loc = np.zeros((2, 2), dtype=np.float32)  # [2_players, xy]
+
         # Transpose to (N, T, ...) to match Waymo convention
         valid_mask = torch.from_numpy(is_alive.T)  # (N, T)
         position = torch.from_numpy(coordinate.transpose(1, 0, 2))  # (N, T, 3)
@@ -177,6 +180,7 @@ class SCDataset(Dataset):
             "scenario_id": scenario_id,
             "map_name": map_name,
             "creep": torch.from_numpy(creep),  # (H, W) float32
+            "player_start_loc": torch.from_numpy(player_start_loc),  # [2, 2]
             "agent": {
                 "num_nodes": N,
                 "valid_mask": valid_mask,

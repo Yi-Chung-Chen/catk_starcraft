@@ -15,6 +15,7 @@ from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, transform_to_global, weight_init, wrap_angle
+from src.starcraft.layers.concept_attention import ConceptAttentionLayer
 from src.starcraft.utils.sc_rollout import sample_next_token_traj_contour
 from src.starcraft.utils.unit_type_map import NUM_UNIT_TYPES
 
@@ -36,6 +37,7 @@ class SCAgentDecoder(nn.Module):
         dropout: float,
         hist_drop_prob: float,
         n_token_agent: int,
+        num_concepts: int = 16,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -45,6 +47,7 @@ class SCAgentDecoder(nn.Module):
         self.pl2a_radius = pl2a_radius
         self.a2a_radius = a2a_radius
         self.num_layers = num_layers
+        self.num_concepts = num_concepts
         self.shift = 8
         self.hist_drop_prob = hist_drop_prob
 
@@ -123,6 +126,22 @@ class SCAgentDecoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        if num_concepts > 0:
+            self.concept_pos_emb = FourierEmbedding(
+                input_dim=3, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands
+            )
+            self.concept_attn_layers = nn.ModuleList(
+                [
+                    ConceptAttentionLayer(
+                        hidden_dim=hidden_dim,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        num_concepts=num_concepts,
+                        dropout=dropout,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
         self.token_predict_head = MLPLayer(
             input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=n_token_agent
         )
@@ -379,7 +398,22 @@ class SCAgentDecoder(nn.Module):
             map_feature["pt_token"].unsqueeze(0).expand(n_step, -1, -1).flatten(0, 1)
         )
 
-        # Attention layers: temporal + map-to-agent + agent-to-agent
+        # Pre-build concept attention edges (reused across all layers)
+        num_graphs = tokenized_agent["num_graphs"]
+        if self.num_concepts > 0:
+            concept_edge_data = self.concept_attn_layers[0].build_concept_edges(
+                owner=tokenized_agent["owner"],
+                visible_status=tokenized_agent["visible_status"],
+                valid_mask=tokenized_agent["valid_mask"],
+                batch=tokenized_agent["batch"],
+                n_step=n_step,
+                num_graphs=num_graphs,
+                pos_a=pos_a,
+                player_start_loc=tokenized_agent["player_start_loc"],
+                pos_emb=self.concept_pos_emb,
+            )
+
+        # Attention layers: temporal + map-to-agent + agent-to-agent + concept
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
             feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
@@ -388,6 +422,9 @@ class SCAgentDecoder(nn.Module):
                 (feat_map, feat_a), r_pl2a, edge_index_pl2a
             )
             feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            # feat_a is [n_step*n_agent, hidden_dim] (step-major)
+            if self.num_concepts > 0:
+                feat_a = self.concept_attn_layers[i](feat_a, **concept_edge_data)
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
 
         next_token_logits = self.token_predict_head(feat_a)
@@ -513,6 +550,22 @@ class SCAgentDecoder(nn.Module):
                 visible_status=tokenized_agent["visible_status"][:, n_step - hist_step:n_step],
             )
 
+            # Build concept attention edges for this rollout step
+            if self.num_concepts > 0:
+                vis_idx_end = min(n_step, 18)
+                vis_idx_start = vis_idx_end - hist_step
+                concept_edge_data = self.concept_attn_layers[0].build_concept_edges(
+                    owner=tokenized_agent["owner"],
+                    visible_status=tokenized_agent["visible_status"][:, vis_idx_start:vis_idx_end],
+                    valid_mask=pred_valid[:, n_step - hist_step:n_step],
+                    batch=tokenized_agent["batch"],
+                    n_step=hist_step,
+                    num_graphs=tokenized_agent["num_graphs"],
+                    pos_a=pos_a[:, -hist_step:],
+                    player_start_loc=tokenized_agent["player_start_loc"],
+                    pos_emb=self.concept_pos_emb,
+                )
+
             for i in range(self.num_layers):
                 _feat_temporal = feat_a if i == 0 else feat_a_t_dict[i]
 
@@ -534,6 +587,11 @@ class SCAgentDecoder(nn.Module):
                     _feat_temporal = self.a2a_attn_layers[i](
                         _feat_temporal, r_a2a, edge_index_a2a
                     )
+                    # _feat_temporal is [n_step*n_agent, d] (step-major)
+                    if self.num_concepts > 0:
+                        _feat_temporal = self.concept_attn_layers[i](
+                            _feat_temporal, **concept_edge_data
+                        )
                     _feat_temporal = _feat_temporal.view(n_step, n_agent, -1).transpose(0, 1)
                     feat_a_now = _feat_temporal[:, -1]
                     if i + 1 < self.num_layers:
@@ -549,6 +607,11 @@ class SCAgentDecoder(nn.Module):
                     feat_a_now = self.a2a_attn_layers[i](
                         feat_a_now, r_a2a, edge_index_a2a
                     )
+                    # feat_a_now is [n_agent, d] (single timestep)
+                    if self.num_concepts > 0:
+                        feat_a_now = self.concept_attn_layers[i](
+                            feat_a_now, **concept_edge_data
+                        )
                     if i + 1 < self.num_layers:
                         feat_a_t_dict[i + 1] = torch.cat(
                             (feat_a_t_dict[i + 1], feat_a_now.unsqueeze(1)), dim=1

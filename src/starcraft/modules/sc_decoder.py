@@ -28,6 +28,7 @@ class SCDecoder(nn.Module):
         dropout: float,
         hist_drop_prob: float,
         n_token_agent: int,
+        num_concepts: int = 16,
     ) -> None:
         super().__init__()
         self.map_encoder = SCMapEncoder(
@@ -51,6 +52,7 @@ class SCDecoder(nn.Module):
             dropout=dropout,
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
+            num_concepts=num_concepts,
         )
 
     def forward(
