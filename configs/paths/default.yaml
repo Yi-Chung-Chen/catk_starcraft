@@ -16,6 +16,6 @@ output_dir: ${hydra:runtime.output_dir}
 cache_root: /scratch/cache/SMART
 
 # StarCraft data paths
-sc_dataset_root: ${paths.root_dir}/datasets/StarCraftMotion_split_v1_medium
+sc_dataset_root: ${paths.root_dir}/datasets/StarCraftMotion_split_v2_medium
 sc_motion_dict: /local/scratch/a/bai116/datasets/motion_dict_out/motion_dictionary_final.pkl
 sc_map_data: ${paths.root_dir}/datasets/map_data/static

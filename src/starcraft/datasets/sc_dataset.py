@@ -87,6 +87,10 @@ class SCDataset(Dataset):
             H_c, W_c = creep.shape
             creep = np.pad(creep, ((0, 200 - H_c), (0, 200 - W_c)), constant_values=0.0)
 
+            # Player starting locations (xyz float32)
+            p1_start_loc = f.attrs["player_1_start_location"].astype(np.float32)
+            p2_start_loc = f.attrs["player_2_start_location"].astype(np.float32)
+
         T, N = is_alive.shape
 
         # Filter: keep units alive at any timestep
@@ -115,8 +119,11 @@ class SCDataset(Dataset):
         unit_owner = unit_owner[keep_idx]  # (N',)
         N = len(keep_idx)
 
-        # TODO: read player starting locations from h5 file once available
-        player_start_loc = np.zeros((2, 2), dtype=np.float32)  # [2_players, xy]
+        # Player starting locations (xy only, drop z)
+        player_start_loc = np.stack([
+            p1_start_loc[:2],
+            p2_start_loc[:2],
+        ], axis=0)  # [2_players, xy]
 
         # Transpose to (N, T, ...) to match Waymo convention
         valid_mask = torch.from_numpy(is_alive.T)  # (N, T)
