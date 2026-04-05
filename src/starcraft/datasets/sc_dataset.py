@@ -77,6 +77,8 @@ class SCDataset(Dataset):
             health_max = rep["health_max"][:].astype(np.float32)  # (T, N)
             shield = rep["shield"][:].astype(np.float32)  # (T, N)
             energy = rep["energy"][:].astype(np.float32)  # (T, N)
+            ability_id = rep["ability_id"][:].astype(np.int64)  # (T, N)
+            target_pos = rep["target_pos"][:].astype(np.float32)  # (T, N, 2)
 
             # Dynamic map data: creep at current frame
             map_frame_skip = int(f.attrs["map_frame_skip"])
@@ -115,6 +117,8 @@ class SCDataset(Dataset):
         health_max = health_max[:, keep_idx]  # (T, N')
         shield = shield[:, keep_idx]  # (T, N')
         energy = energy[:, keep_idx]  # (T, N')
+        ability_id = ability_id[:, keep_idx]  # (T, N')
+        target_pos = target_pos[:, keep_idx]  # (T, N', 2)
         unit_tag = unit_tag[keep_idx]  # (N',)
         unit_owner = unit_owner[keep_idx]  # (N',)
         N = len(keep_idx)
@@ -130,6 +134,8 @@ class SCDataset(Dataset):
         position = torch.from_numpy(coordinate.transpose(1, 0, 2))  # (N, T, 3)
         heading_t = torch.from_numpy(heading.T)  # (N, T)
         visible_status_t = torch.from_numpy(visible_status.T)  # (N, T)
+        ability_id_t = torch.from_numpy(ability_id.T)  # (N, T)
+        target_pos_t = torch.from_numpy(target_pos.transpose(1, 0, 2))  # (N, T, 2)
         owner_t = torch.from_numpy(unit_owner.astype(np.int64))  # (N,)
 
         # Agent type: use type at current_frame_idx, remap to contiguous indices
@@ -177,11 +183,15 @@ class SCDataset(Dataset):
             visible_status_t = torch.cat(
                 [visible_status_t, torch.zeros(N, pad, dtype=torch.uint8)], dim=1
             )
+            ability_id_t = torch.cat([ability_id_t, torch.zeros(N, pad, dtype=torch.int64)], dim=1)
+            target_pos_t = torch.cat([target_pos_t, torch.zeros(N, pad, 2)], dim=1)
         elif T > TOTAL_FRAMES:
             valid_mask = valid_mask[:, :TOTAL_FRAMES]
             position = position[:, :TOTAL_FRAMES]
             heading_t = heading_t[:, :TOTAL_FRAMES]
             visible_status_t = visible_status_t[:, :TOTAL_FRAMES]
+            ability_id_t = ability_id_t[:, :TOTAL_FRAMES]
+            target_pos_t = target_pos_t[:, :TOTAL_FRAMES]
 
         data = {
             "scenario_id": scenario_id,
@@ -201,6 +211,8 @@ class SCDataset(Dataset):
                 "visible_status": visible_status_t,
                 "unit_state": unit_state_t,
                 "unit_vitals": unit_vitals,
+                "ability_id": ability_id_t,
+                "target_pos": target_pos_t,
             },
         }
         return data

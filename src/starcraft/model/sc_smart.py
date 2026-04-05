@@ -9,6 +9,7 @@ from lightning import LightningModule
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import TokenCls, minADE
+from src.starcraft.metrics.sc_action_target_loss import SCActionTargetLoss
 from src.starcraft.metrics.sc_cross_entropy import SCCrossEntropy
 from src.starcraft.modules.sc_decoder import SCDecoder
 from src.starcraft.tokens.sc_token_processor import SCTokenProcessor
@@ -36,6 +37,7 @@ class SCSMART(LightningModule):
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.training_loss = SCCrossEntropy(**model_config.training_loss)
+        self.action_target_loss = SCActionTargetLoss(**model_config.action_target_loss)
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
 
@@ -63,13 +65,20 @@ class SCSMART(LightningModule):
                 sampling_scheme=self.training_rollout_sampling,
             )
 
-        loss = self.training_loss(
+        loss_motion = self.training_loss(
             **pred,
             token_agent_shape=tokenized_agent["token_agent_shape"],
             token_traj=tokenized_agent["token_traj"],  # [n_token, 4, 2]
             train_mask=data["agent"]["train_mask"],
         )
+        loss_aux = self.action_target_loss(
+            **pred, train_mask=data["agent"]["train_mask"],
+        )
+        loss = loss_motion + loss_aux
         self.log("train/loss", loss, on_step=True, batch_size=1)
+        self.log("train/loss_motion", loss_motion, on_step=True, batch_size=1)
+        for k, v in self.action_target_loss.batch_components().items():
+            self.log(f"train/loss_{k}", v, on_step=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -82,6 +91,9 @@ class SCSMART(LightningModule):
                 token_agent_shape=tokenized_agent["token_agent_shape"],
                 token_traj=tokenized_agent["token_traj"],
             )
+            self.action_target_loss(**pred)
+            for k, v in self.action_target_loss.batch_components().items():
+                self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
 
             self.TokenCls.update(
                 pred=pred["next_token_logits"],
@@ -90,7 +102,7 @@ class SCSMART(LightningModule):
                 target_valid=tokenized_agent["valid_mask"][:, 2:],
             )
             self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
 
         if self.val_closed_loop:
             pred_traj = []

@@ -16,8 +16,30 @@ from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
 from src.smart.utils import cal_circular_contour, transform_to_global, transform_to_local, wrap_angle
+from src.starcraft.utils.coarse_action_mapping import ABILITY_ID_TO_COARSE_ACTION
 
 _PADDED_SIZE = 200  # all maps padded to 200x200
+_TARGET_POS_NORM = 200.0  # normalize relative target pos by map size
+
+# Build a vectorized LUT for coarse action mapping (remap 255→11)
+_MAX_ABILITY_ID = max(ABILITY_ID_TO_COARSE_ACTION.keys())
+# Remap: original classes 1-10 → 0-9, UNKNOWN (255) → 10. NO_OP (0) excluded
+# (supervised only when has_action=True, so NO_OP never appears as a target).
+_NUM_ACTION_CLASSES = 11  # 10 action types + UNKNOWN
+_COARSE_ACTION_LUT = torch.full((_MAX_ABILITY_ID + 2,), 10, dtype=torch.long)  # default: UNKNOWN→10
+for _aid, _label in ABILITY_ID_TO_COARSE_ACTION.items():
+    if _label == 0:
+        _COARSE_ACTION_LUT[_aid] = 0  # NO_OP placeholder (won't be supervised)
+    elif _label == 255:
+        _COARSE_ACTION_LUT[_aid] = 10  # UNKNOWN
+    else:
+        _COARSE_ACTION_LUT[_aid] = _label - 1  # shift 1-10 → 0-9
+
+
+def _vectorized_coarse_action(ability_ids: Tensor) -> Tensor:
+    """Map raw ability_id tensor to coarse action labels (0-10, NO_OP excluded)."""
+    clamped = ability_ids.clamp(0, _MAX_ABILITY_ID + 1)
+    return _COARSE_ACTION_LUT.to(clamped.device)[clamped]
 _PATCH_STRIDE = 8   # CNN stride-8 downsampling (3 layers) → 25x25 grid
 _GRID_SIZE = _PADDED_SIZE // _PATCH_STRIDE  # 25
 
@@ -179,6 +201,18 @@ class SCTokenProcessor(torch.nn.Module):
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, 18]
             "gt_valid_raw": valid[:, self.shift :: self.shift],  # [n_agent, 18]
         }
+
+        # Action & target labels at token boundaries (last frame of each window)
+        ability_steps = data["agent"]["ability_id"][:, self.shift :: self.shift]  # [n_agent, 18]
+        target_steps = data["agent"]["target_pos"][:, self.shift :: self.shift]  # [n_agent, 18, 2]
+        unit_pos_steps = pos[:, self.shift :: self.shift]  # [n_agent, 18, 2]
+
+        tokenized_agent["coarse_action"] = _vectorized_coarse_action(ability_steps)  # [n_agent, 18] 0-10
+        tokenized_agent["has_action"] = (ability_steps != 0)  # [n_agent, 18]
+        tokenized_agent["has_target_pos"] = (target_steps.abs().sum(-1) > 0)  # [n_agent, 18]
+        rel_target = (target_steps - unit_pos_steps) / _TARGET_POS_NORM  # [n_agent, 18, 2]
+        rel_target[~tokenized_agent["has_target_pos"]] = 0.0
+        tokenized_agent["rel_target_pos"] = rel_target  # [n_agent, 18, 2]
 
         if not self.training:
             tokenized_agent["gt_z_raw"] = data["agent"]["position"][

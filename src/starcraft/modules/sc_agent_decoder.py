@@ -38,6 +38,8 @@ class SCAgentDecoder(nn.Module):
         hist_drop_prob: float,
         n_token_agent: int,
         num_concepts: int = 16,
+        use_action_target_input: bool = False,
+        num_action_classes: int = 11,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -145,6 +147,21 @@ class SCAgentDecoder(nn.Module):
         self.token_predict_head = MLPLayer(
             input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=n_token_agent
         )
+
+        # Auxiliary prediction heads: action & target
+        self.num_action_classes = num_action_classes
+        self.has_action_head = MLPLayer(hidden_dim, hidden_dim, 1)
+        self.has_target_pos_head = MLPLayer(hidden_dim, hidden_dim, 1)
+        self.action_class_head = MLPLayer(hidden_dim, hidden_dim, num_action_classes)
+        self.target_pos_head = MLPLayer(hidden_dim, hidden_dim, 2)
+
+        # Optional action/target input embeddings for ablation
+        self.use_action_target_input = use_action_target_input
+        if use_action_target_input:
+            self.action_input_emb = nn.Embedding(num_action_classes, hidden_dim)
+            self.target_input_emb = MLPLayer(2, hidden_dim, hidden_dim)
+            self.aux_fusion = MLPLayer(hidden_dim * 3, hidden_dim, hidden_dim)
+
         self.apply(weight_init)
 
     def agent_token_embedding(
@@ -157,6 +174,9 @@ class SCAgentDecoder(nn.Module):
         unit_state,  # [n_agent]
         unit_props,  # [n_agent, 4] (radius, health, shield, energy)
         inference=False,
+        prev_action=None,  # [n_agent, n_step] coarse action class
+        prev_target_pos=None,  # [n_agent, n_step, 2] relative target pos
+        prev_has_action=None,  # [n_agent, n_step] bool
     ):
         n_agent, n_step, traj_dim = pos_a.shape
 
@@ -195,6 +215,16 @@ class SCAgentDecoder(nn.Module):
 
         feat_a = torch.cat((agent_token_emb, x_a), dim=-1)
         feat_a = self.fusion_emb(feat_a)
+
+        if self.use_action_target_input and prev_action is not None:
+            action_emb = self.action_input_emb(prev_action.long())  # [n_agent, n_step, hidden_dim]
+            # Zero out action embedding for idle steps (has_action=False)
+            if prev_has_action is not None:
+                action_emb = action_emb * prev_has_action.unsqueeze(-1).float()
+            target_emb = self.target_input_emb(prev_target_pos)  # [n_agent, n_step, hidden_dim]
+            feat_a = self.aux_fusion(
+                torch.cat([feat_a, action_emb, target_emb], dim=-1)
+            )
 
         if inference:
             return feat_a, agent_token_emb, agent_token_emb_all, categorical_embs
@@ -358,6 +388,9 @@ class SCAgentDecoder(nn.Module):
             agent_type=tokenized_agent["type"],
             unit_state=tokenized_agent["unit_state"],
             unit_props=tokenized_agent["unit_props"],
+            prev_action=tokenized_agent.get("coarse_action"),
+            prev_target_pos=tokenized_agent.get("rel_target_pos"),
+            prev_has_action=tokenized_agent.get("has_action"),
         )
 
         edge_index_t, r_t = self.build_temporal_edge(
@@ -429,6 +462,12 @@ class SCAgentDecoder(nn.Module):
 
         next_token_logits = self.token_predict_head(feat_a)
 
+        # Auxiliary heads
+        has_action_logits = self.has_action_head(feat_a).squeeze(-1)  # [n_agent, 18]
+        has_target_pos_logits = self.has_target_pos_head(feat_a).squeeze(-1)  # [n_agent, 18]
+        action_class_logits = self.action_class_head(feat_a)  # [n_agent, 18, n_action]
+        target_pos_pred = self.target_pos_head(feat_a)  # [n_agent, 18, 2]
+
         return {
             "next_token_logits": next_token_logits[:, 1:-1],  # [n_agent, 16, n_token]
             "next_token_valid": tokenized_agent["valid_mask"][:, 1:-1],
@@ -441,6 +480,15 @@ class SCAgentDecoder(nn.Module):
             "gt_pos": tokenized_agent["gt_pos"],
             "gt_head": tokenized_agent["gt_heading"],
             "gt_valid": tokenized_agent["valid_mask"],
+            # Auxiliary predictions (steps 1:-1 → 16 steps, GT 2: → 16 steps)
+            "has_action_logits": has_action_logits[:, 1:-1],
+            "has_target_pos_logits": has_target_pos_logits[:, 1:-1],
+            "action_class_logits": action_class_logits[:, 1:-1],
+            "target_pos_pred": target_pos_pred[:, 1:-1],
+            "gt_has_action": tokenized_agent["has_action"][:, 2:],
+            "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
+            "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
+            "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
         }
 
     def inference(
@@ -470,6 +518,9 @@ class SCAgentDecoder(nn.Module):
                 unit_state=tokenized_agent["unit_state"],
                 unit_props=tokenized_agent["unit_props"],
                 inference=True,
+                prev_action=tokenized_agent["coarse_action"][:, :step_current_2hz] if self.use_action_target_input else None,
+                prev_target_pos=tokenized_agent["rel_target_pos"][:, :step_current_2hz] if self.use_action_target_input else None,
+                prev_has_action=tokenized_agent["has_action"][:, :step_current_2hz] if self.use_action_target_input else None,
             )
         )
 
@@ -489,6 +540,10 @@ class SCAgentDecoder(nn.Module):
         pred_valid = tokenized_agent["valid_mask"].clone()
         next_token_logits_list = []
         next_token_action_list = []
+        aux_has_action_list = []
+        aux_has_target_pos_list = []
+        aux_action_list = []
+        aux_target_pos_list = []
         feat_a_t_dict = {}
 
         for t in range(n_step_future_2hz):
@@ -620,6 +675,13 @@ class SCAgentDecoder(nn.Module):
             next_token_logits = self.token_predict_head(feat_a_now)
             next_token_logits_list.append(next_token_logits)
 
+            # Auxiliary predictions at this rollout step
+            aux_has_action_list.append(self.has_action_head(feat_a_now).squeeze(-1))
+            aux_has_target_pos_list.append(self.has_target_pos_head(feat_a_now).squeeze(-1))
+            aux_action_logits = self.action_class_head(feat_a_now)
+            aux_action_list.append(aux_action_logits)
+            aux_target_pos_list.append(self.target_pos_head(feat_a_now))
+
             next_token_idx, next_token_traj_all = (
                 sample_next_token_traj_contour(
                     token_traj=token_traj,
@@ -699,6 +761,24 @@ class SCAgentDecoder(nn.Module):
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
             feat_a_next = torch.cat((agent_token_emb_next, x_a), dim=-1).unsqueeze(1)
             feat_a_next = self.fusion_emb(feat_a_next)
+
+            # Feed predicted action/target back as input for next step
+            if self.use_action_target_input:
+                has_action_pred = (aux_has_action_list[-1] > 0)  # [n_agent]
+                action_pred = aux_action_logits.argmax(-1)  # [n_agent]
+                # Zero embedding for idle units (has_action=False)
+                action_emb_next = self.action_input_emb(action_pred)  # [n_agent, hidden_dim]
+                action_emb_next[~has_action_pred] = 0.0
+
+                has_tp_pred = (aux_has_target_pos_list[-1] > 0)  # [n_agent]
+                target_pred = aux_target_pos_list[-1].clone()  # [n_agent, 2]
+                target_pred[~has_tp_pred] = 0.0
+                target_emb_next = self.target_input_emb(target_pred)  # [n_agent, hidden_dim]
+
+                feat_a_next = self.aux_fusion(
+                    torch.cat([feat_a_next, action_emb_next.unsqueeze(1), target_emb_next.unsqueeze(1)], dim=-1)
+                )
+
             feat_a = torch.cat([feat_a, feat_a_next], dim=1)
 
         out_dict = {
@@ -715,6 +795,15 @@ class SCAgentDecoder(nn.Module):
             "gt_head": tokenized_agent["gt_heading"],
             "gt_valid": tokenized_agent["valid_mask"],
             "next_token_action": torch.stack(next_token_action_list, dim=1),
+            # Auxiliary predictions & GT
+            "has_action_logits": torch.stack(aux_has_action_list, dim=1),
+            "has_target_pos_logits": torch.stack(aux_has_target_pos_list, dim=1),
+            "action_class_logits": torch.stack(aux_action_list, dim=1),
+            "target_pos_pred": torch.stack(aux_target_pos_list, dim=1),
+            "gt_has_action": tokenized_agent["has_action"][:, 2:],
+            "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
+            "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
+            "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
         }
 
         if not self.training:

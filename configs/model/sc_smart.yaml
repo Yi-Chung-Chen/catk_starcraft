@@ -39,6 +39,13 @@ model_config:
     num_historical_steps: 17
     num_future_steps: 128
     num_concepts: 16
+    use_action_target_input: false
+    num_action_classes: 11
+  action_target_loss:
+    has_action_weight: 1.0
+    has_target_pos_weight: 1.0
+    action_weight: 1.0
+    target_weight: 1.0
   training_loss:
     use_gt_raw: true
     gt_thresh_scale_length: -1.0
