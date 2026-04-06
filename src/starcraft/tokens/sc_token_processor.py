@@ -115,12 +115,13 @@ class SCTokenProcessor(torch.nn.Module):
         )  # [25, 25, 8, 8]
         valid_mask = valid_patches.reshape(_GRID_SIZE * _GRID_SIZE, -1).any(dim=1)  # [625]
 
-        # Patch center positions in game coordinates: (col→X, row→Y)
+        # Patch center positions in game coordinates (col→X, row→Y flipped:
+        # row 0 = top of map = high Y in game coords)
         row_idx = torch.arange(_GRID_SIZE, dtype=torch.float32).unsqueeze(1).expand(_GRID_SIZE, _GRID_SIZE)
         col_idx = torch.arange(_GRID_SIZE, dtype=torch.float32).unsqueeze(0).expand(_GRID_SIZE, _GRID_SIZE)
         position = torch.stack([
             col_idx.reshape(-1) * _PATCH_STRIDE + _PATCH_STRIDE / 2.0,  # X
-            row_idx.reshape(-1) * _PATCH_STRIDE + _PATCH_STRIDE / 2.0,  # Y
+            H - (row_idx.reshape(-1) * _PATCH_STRIDE + _PATCH_STRIDE / 2.0),  # Y
         ], dim=-1)  # [625, 2]
 
         result = {"map_grid": grid, "position": position, "valid_mask": valid_mask}
