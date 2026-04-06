@@ -79,6 +79,7 @@ class SCDataset(Dataset):
             energy = rep["energy"][:].astype(np.float32)  # (T, N)
             ability_id = rep["ability_id"][:].astype(np.int64)  # (T, N)
             target_pos = rep["target_pos"][:].astype(np.float32)  # (T, N, 2)
+            target_id = rep["target_id"][:]  # (T, N) uint32, row index; 0xFFFFFFFF = no target
 
             # Dynamic map data: creep at current frame
             map_frame_skip = int(f.attrs["map_frame_skip"])
@@ -94,6 +95,16 @@ class SCDataset(Dataset):
             p2_start_loc = f.attrs["player_2_start_location"].astype(np.float32)
 
         T, N = is_alive.shape
+
+        # --- Resolve target_id to XY and merge into target_pos ---
+        SENTINEL = np.uint32(0xFFFFFFFF)
+        has_tid = (target_id != SENTINEL) & (target_id < N)
+        tid_safe = np.where(has_tid, target_id, 0).astype(np.intp)
+        t_idx = np.arange(T)[:, None]
+        has_tid &= is_alive[t_idx, tid_safe]          # target unit must be alive
+        resolved_xy = coordinate[t_idx, tid_safe, :2]  # (T, N, 2)
+        fill_mask = has_tid & (np.abs(target_pos).sum(axis=-1) == 0)
+        target_pos[fill_mask] = resolved_xy[fill_mask]
 
         # Filter: keep units alive at any timestep
         ever_alive = is_alive.any(axis=0)  # (N,)
