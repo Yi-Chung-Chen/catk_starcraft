@@ -114,11 +114,16 @@ class SCSMART(LightningModule):
 
         if self.val_closed_loop:
             pred_traj = []
+            aux_target_list = []
+            _AUX_KEYS = ("target_pos_pred", "has_target_pos_logits",
+                         "gt_rel_target_pos", "gt_has_target_pos")
             for _ in range(self.n_rollout_closed_val):
                 pred = self.encoder.inference(
                     tokenized_map, tokenized_agent, self.validation_rollout_sampling
                 )
                 pred_traj.append(pred["pred_traj_native"])
+                if self.use_aux_loss and "target_pos_pred" in pred:
+                    aux_target_list.append({k: pred[k] for k in _AUX_KEYS})
 
             pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
 
@@ -147,9 +152,11 @@ class SCSMART(LightningModule):
                 n_rollouts_vis = min(self.n_vis_rollout, pred_traj.shape[1])
                 for i_sc in range(n_scenarios):
                     for i_roll in range(n_rollouts_vis):
+                        aux_data = aux_target_list[i_roll] if aux_target_list else None
                         sc_data = extract_scenario_data(
                             data, pred_traj, i_sc, i_roll,
                             num_historical_steps=self.num_historical_steps,
+                            aux_target_data=aux_data,
                         )
                         save_dir = (
                             self.gif_dir

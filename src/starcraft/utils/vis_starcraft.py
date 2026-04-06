@@ -13,7 +13,7 @@ FPS = 16  # native frame rate
 
 
 def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
-                          num_historical_steps=17):
+                          num_historical_steps=17, aux_target_data=None):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -23,6 +23,8 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
         rollout_idx: Which rollout to extract.
         num_historical_steps: Agents must be alive at frame
             (num_historical_steps - 1) to have valid predictions.
+        aux_target_data: Optional dict with target_pos_pred, has_target_pos_logits,
+            gt_rel_target_pos, gt_has_target_pos tensors (batch-level).
 
     Returns:
         Dict with numpy arrays for one scenario + one rollout.
@@ -36,7 +38,7 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
     current_frame = num_historical_steps - 1
     pred_agent_mask = valid[:, current_frame].cpu().numpy()
 
-    return {
+    out = {
         "gt_positions": data["agent"]["position"][mask, :, :2].cpu().numpy(),
         "gt_valid": valid.cpu().numpy(),
         "pred_positions": pred_traj[mask, rollout_idx].cpu().numpy(),
@@ -44,6 +46,17 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
         "owner": data["agent"]["owner"][mask].cpu().numpy(),
         "scenario_id": data["scenario_id"][scenario_idx],
     }
+
+    if aux_target_data is not None:
+        out["pred_target_rel"] = aux_target_data["target_pos_pred"][mask].cpu().numpy()
+        out["pred_has_target"] = (aux_target_data["has_target_pos_logits"][mask] > 0).cpu().numpy()
+        out["gt_target_rel"] = aux_target_data["gt_rel_target_pos"][mask].cpu().numpy()
+        out["gt_has_target"] = aux_target_data["gt_has_target_pos"][mask].cpu().numpy()
+
+    return out
+
+
+_TARGET_POS_NORM = 200.0
 
 
 def save_scenario_gif(
@@ -58,6 +71,10 @@ def save_scenario_gif(
     frame_step=2,
     trail_length=16,
     gif_fps=8,
+    pred_target_rel=None,
+    pred_has_target=None,
+    gt_target_rel=None,
+    gt_has_target=None,
 ):
     """Render an animated GIF showing GT and predicted trajectories.
 
@@ -163,10 +180,32 @@ def save_scenario_gif(
         )
         pred_trail_lines.append((u, line))
 
+    # Target position lines: unit → target (only for mobile player units)
+    has_targets = gt_target_rel is not None
+    target_shift = 8  # target data sampled every 8 native frames
+    gt_target_lines = []
+    pred_target_lines = []
+    if has_targets:
+        for u in np.where(mobile & (p1_mask | p2_mask) & pred_agent_mask)[0]:
+            color_gt = "dodgerblue" if p1_mask[u] else "tomato"
+            color_pred = "cornflowerblue" if p1_mask[u] else "salmon"
+            (gl,) = ax.plot([], [], "-", color=color_gt, alpha=0.5, linewidth=0.8, zorder=6)
+            gt_target_lines.append((u, gl))
+            (pl,) = ax.plot([], [], "--", color=color_pred, alpha=0.5, linewidth=0.8, zorder=6)
+            pred_target_lines.append((u, pl))
+        scat_gt_target = ax.scatter(
+            [], [], c="limegreen", s=20, marker="x", linewidths=1.0,
+            label="GT Target", zorder=7,
+        )
+        scat_pred_target = ax.scatter(
+            [], [], c="orange", s=20, marker="x", linewidths=1.0,
+            label="Pred Target", zorder=7,
+        )
+
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal")
-    ax.legend(loc="upper left", fontsize=8, ncol=3)
+    ax.legend(loc="upper left", fontsize=8, ncol=3 if not has_targets else 4)
     ax.grid(True, alpha=0.15)
     ax.set_xlabel("X (game units)")
     ax.set_ylabel("Y (game units)")
@@ -214,11 +253,50 @@ def save_scenario_gif(
                     line.set_data(seg[:, 0], seg[:, 1])
                 else:
                     line.set_data([], [])
+
+            # --- Target position arrows ---
+            if has_targets:
+                step_2hz = min(pred_idx // target_shift, gt_target_rel.shape[1] - 1)
+                # Use unit position at the 2Hz boundary frame (not current frame)
+                # to keep target fixed for the whole 8-frame window.
+                # 2Hz steps 0..15 correspond to native frames 24,32,...,144
+                boundary_frame = (step_2hz + 3) * target_shift
+                boundary_frame = min(boundary_frame, T - 1)
+                boundary_pred_idx = boundary_frame - num_historical_steps
+                gt_tgt_pts = []
+                pred_tgt_pts = []
+                for u, gl in gt_target_lines:
+                    if gt_valid[u, frame_idx] and gt_has_target[u, step_2hz]:
+                        anchor = gt_positions[u, boundary_frame]
+                        tgt = anchor + gt_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        gl.set_data([gt_positions[u, frame_idx, 0], tgt[0]],
+                                    [gt_positions[u, frame_idx, 1], tgt[1]])
+                        gt_tgt_pts.append(tgt)
+                    else:
+                        gl.set_data([], [])
+                for u, pl in pred_target_lines:
+                    if gt_valid[u, frame_idx] and pred_has_target[u, step_2hz]:
+                        anchor = pred_positions[u, boundary_pred_idx]
+                        tgt = anchor + pred_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        pl.set_data([pred_positions[u, pred_idx, 0], tgt[0]],
+                                    [pred_positions[u, pred_idx, 1], tgt[1]])
+                        pred_tgt_pts.append(tgt)
+                    else:
+                        pl.set_data([], [])
+                scat_gt_target.set_offsets(np.array(gt_tgt_pts) if gt_tgt_pts else np.empty((0, 2)))
+                scat_pred_target.set_offsets(np.array(pred_tgt_pts) if pred_tgt_pts else np.empty((0, 2)))
         else:
             scat_pred_p1.set_offsets(np.empty((0, 2)))
             scat_pred_p2.set_offsets(np.empty((0, 2)))
             for _, line in pred_trail_lines:
                 line.set_data([], [])
+            if has_targets:
+                for _, gl in gt_target_lines:
+                    gl.set_data([], [])
+                for _, pl in pred_target_lines:
+                    pl.set_data([], [])
+                scat_gt_target.set_offsets(np.empty((0, 2)))
+                scat_pred_target.set_offsets(np.empty((0, 2)))
 
         # Phase text
         if frame_idx < num_historical_steps - 1:
@@ -242,6 +320,10 @@ def save_scenario_gif(
         artists = [scat_gt_p1, scat_gt_p2, scat_pred_p1, scat_pred_p2, time_text]
         artists += [l for _, l in gt_trail_lines]
         artists += [l for _, l in pred_trail_lines]
+        if has_targets:
+            artists += [l for _, l in gt_target_lines]
+            artists += [l for _, l in pred_target_lines]
+            artists += [scat_gt_target, scat_pred_target]
         return artists
 
     frame_indices = list(range(0, T, frame_step))
