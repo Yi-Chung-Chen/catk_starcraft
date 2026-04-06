@@ -111,6 +111,60 @@ The decoder stack (`src/smart/modules/smart_decoder.py`) contains:
 - `geometry.py`: Trajectory geometry utilities
 - `preprocess.py`: Data preprocessing helpers
 
+## StarCraft Branch (`src/starcraft/`)
+
+### Overview
+Adapts the SMART tokenized motion model for StarCraft II unit trajectory prediction. Uses the same token-based architecture but with StarCraft-specific data loading, map encoding, and auxiliary prediction heads.
+
+### Model (`src/starcraft/model/sc_smart.py`)
+- **SCSMART** LightningModule, config at `configs/model/sc_smart.yaml`
+- `use_aux_loss: true/false` — controls whether auxiliary action/target prediction heads exist (not just loss weight — heads are removed when false). Ablate via `model.model_config.use_aux_loss=false`
+
+### Data Pipeline
+- **Dataset** (`src/starcraft/datasets/sc_dataset.py`): Reads per-replay HDF5 files from `StarCraftMotion_split_v2_medium/`
+  - Loads `target_id` (uint32 row index, sentinel `0xFFFFFFFF`) and resolves to XY via coordinate lookup, merged into `target_pos` for ~96% target coverage
+  - `target_id` and `target_pos` are mutually exclusive in the data
+- **Token processor** (`src/starcraft/tokens/sc_token_processor.py`): Tokenizes agent trajectories and loads static map data
+  - Map data cached per map_name (7 maps), loaded from `datasets/map_data/static/{Map_Name}.h5`
+
+### Map Encoder (`src/starcraft/modules/sc_map_encoder.py`)
+- CNN processes `[B, 3, 200, 200]` grid (pathing + height + creep) → `[B*625, hidden_dim]` patch tokens
+- 25×25 patches (8×8 cells each), connected to agents via radius-based pl2a attention
+
+### Coordinate System (important)
+- **Game coordinates**: X = column, Y increases upward from bottom
+- **Pathing grid**: Row 0 = top of map = **high Y** in game coordinates
+- **Patch positions**: Y is flipped from row index: `Y = H - (row_idx * 8 + 4)`
+- **Visualization**: `imshow` with `origin="upper"` and `extent=[0, W, 0, H]`
+
+### Auxiliary Prediction Heads (when `use_aux_loss=true`)
+Four heads in `sc_agent_decoder.py`: `has_action`, `has_target_pos`, `action_class` (11 classes), `target_pos` (2D XY)
+- Loss in `src/starcraft/metrics/sc_action_target_loss.py`
+- `use_action_target_input` feeds predictions back as input (requires `use_aux_loss=true`)
+
+### Visualization (`src/starcraft/utils/vis_starcraft.py`)
+- Animated GIFs showing GT + predicted trajectories
+- Optional pathing grid background overlay (pre-padding map)
+- Optional target position arrows (GT green "x", pred orange "x")
+- Controlled by `n_vis_batch`, `n_vis_scenario`, `n_vis_rollout` in model config
+
+### StarCraft Experiment Configs
+- `experiment/sc_pre_bc.yaml` — BC pre-training (lr=5e-4, 64 epochs)
+- `model/sc_smart.yaml` — default model (hidden_dim=64, 4 heads, 4 agent layers, 3 map layers)
+- `data/starcraft.yaml` — StarCraft datamodule config
+
+### Running StarCraft Experiments
+```bash
+# BC pre-training
+torchrun -m src.run experiment=sc_pre_bc task_name=my_sc_task
+
+# With aux loss ablation
+torchrun -m src.run experiment=sc_pre_bc model.model_config.use_aux_loss=false task_name=no_aux
+
+# Validation with visualization
+python -m src.run experiment=sc_pre_bc action=validate ckpt_path=/path/to/ckpt.ckpt model.model_config.n_vis_batch=2
+```
+
 ## Key Design Decisions
 
 - **Two-phase training**: BC pre-training then CAT-K fine-tuning. The `action=finetune` mode loads weights with `load_state_dict(..., strict=False)` instead of resuming optimizer state.
