@@ -4,6 +4,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import os
+
+import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -13,7 +16,8 @@ FPS = 16  # native frame rate
 
 
 def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
-                          num_historical_steps=17, aux_target_data=None):
+                          num_historical_steps=17, aux_target_data=None,
+                          map_data_dir=None):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -53,6 +57,12 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
         out["gt_target_rel"] = aux_target_data["gt_rel_target_pos"][mask].cpu().numpy()
         out["gt_has_target"] = aux_target_data["gt_has_target_pos"][mask].cpu().numpy()
 
+    if map_data_dir is not None:
+        map_names = data["map_name"]
+        map_name = map_names[scenario_idx] if isinstance(map_names, (list, tuple)) else map_names
+        with h5py.File(os.path.join(map_data_dir, f"{map_name}.h5"), "r") as f:
+            out["pathing_grid"] = f["pathing_grid"][:].astype(np.float32)  # [H, W] before padding
+
     return out
 
 
@@ -75,6 +85,7 @@ def save_scenario_gif(
     pred_has_target=None,
     gt_target_rel=None,
     gt_has_target=None,
+    pathing_grid=None,
 ):
     """Render an animated GIF showing GT and predicted trajectories.
 
@@ -124,6 +135,15 @@ def save_scenario_gif(
 
     # --- Set up figure ---
     fig, ax = plt.subplots(figsize=(12, 8))
+
+    # Pathing grid background (before padding, original H x W)
+    if pathing_grid is not None:
+        H_map, W_map = pathing_grid.shape
+        ax.imshow(
+            pathing_grid, cmap="Greys_r", alpha=0.3,
+            extent=[0, W_map, 0, H_map],  # [left, right, bottom, top]
+            origin="upper", zorder=0,
+        )
 
     # Neutral units (static, from frame 0)
     neutral_alive_0 = gt_valid[:, 0] & neutral_mask

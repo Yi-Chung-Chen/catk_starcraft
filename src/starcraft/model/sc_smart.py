@@ -157,6 +157,7 @@ class SCSMART(LightningModule):
                             data, pred_traj, i_sc, i_roll,
                             num_historical_steps=self.num_historical_steps,
                             aux_target_data=aux_data,
+                            map_data_dir=self.token_processor.map_data_dir,
                         )
                         save_dir = (
                             self.gif_dir
