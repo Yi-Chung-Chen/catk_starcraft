@@ -31,13 +31,17 @@ class SCSMART(LightningModule):
         self.val_closed_loop = model_config.val_closed_loop
 
         self.token_processor = SCTokenProcessor(**model_config.token_processor)
+        self.use_aux_loss = model_config.use_aux_loss
         self.encoder = SCDecoder(
-            **model_config.decoder, n_token_agent=self.token_processor.n_token_agent
+            **model_config.decoder,
+            n_token_agent=self.token_processor.n_token_agent,
+            use_aux_loss=self.use_aux_loss,
         )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.training_loss = SCCrossEntropy(**model_config.training_loss)
-        self.action_target_loss = SCActionTargetLoss(**model_config.action_target_loss)
+        if self.use_aux_loss:
+            self.action_target_loss = SCActionTargetLoss(**model_config.action_target_loss)
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
 
@@ -71,14 +75,17 @@ class SCSMART(LightningModule):
             token_traj=tokenized_agent["token_traj"],  # [n_token, 4, 2]
             train_mask=data["agent"]["train_mask"],
         )
-        loss_aux = self.action_target_loss(
-            **pred, train_mask=data["agent"]["train_mask"],
-        )
-        loss = loss_motion + loss_aux
+        if self.use_aux_loss:
+            loss_aux = self.action_target_loss(
+                **pred, train_mask=data["agent"]["train_mask"],
+            )
+            loss = loss_motion + loss_aux
+            for k, v in self.action_target_loss.batch_components().items():
+                self.log(f"train/loss_{k}", v, on_step=True, batch_size=1)
+        else:
+            loss = loss_motion
         self.log("train/loss", loss, on_step=True, batch_size=1)
         self.log("train/loss_motion", loss_motion, on_step=True, batch_size=1)
-        for k, v in self.action_target_loss.batch_components().items():
-            self.log(f"train/loss_{k}", v, on_step=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -91,9 +98,10 @@ class SCSMART(LightningModule):
                 token_agent_shape=tokenized_agent["token_agent_shape"],
                 token_traj=tokenized_agent["token_traj"],
             )
-            self.action_target_loss(**pred)
-            for k, v in self.action_target_loss.batch_components().items():
-                self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
+            if self.use_aux_loss:
+                self.action_target_loss(**pred)
+                for k, v in self.action_target_loss.batch_components().items():
+                    self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
 
             self.TokenCls.update(
                 pred=pred["next_token_logits"],

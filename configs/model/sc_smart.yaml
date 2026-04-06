@@ -41,6 +41,7 @@ model_config:
     num_concepts: 16
     use_action_target_input: false
     num_action_classes: 11
+  use_aux_loss: true
   action_target_loss:
     has_action_weight: 1.0
     has_target_pos_weight: 1.0

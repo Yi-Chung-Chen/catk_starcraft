@@ -29,6 +29,7 @@ class SCDecoder(nn.Module):
         hist_drop_prob: float,
         n_token_agent: int,
         num_concepts: int = 16,
+        use_aux_loss: bool = True,
         use_action_target_input: bool = False,
         num_action_classes: int = 11,
     ) -> None:
@@ -55,6 +56,7 @@ class SCDecoder(nn.Module):
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
             num_concepts=num_concepts,
+            use_aux_loss=use_aux_loss,
             use_action_target_input=use_action_target_input,
             num_action_classes=num_action_classes,
         )

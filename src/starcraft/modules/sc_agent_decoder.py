@@ -38,6 +38,7 @@ class SCAgentDecoder(nn.Module):
         hist_drop_prob: float,
         n_token_agent: int,
         num_concepts: int = 16,
+        use_aux_loss: bool = True,
         use_action_target_input: bool = False,
         num_action_classes: int = 11,
     ) -> None:
@@ -149,15 +150,22 @@ class SCAgentDecoder(nn.Module):
         )
 
         # Auxiliary prediction heads: action & target
+        self.use_aux_loss = use_aux_loss
         self.num_action_classes = num_action_classes
-        self.has_action_head = MLPLayer(hidden_dim, hidden_dim, 1)
-        self.has_target_pos_head = MLPLayer(hidden_dim, hidden_dim, 1)
-        self.action_class_head = MLPLayer(hidden_dim, hidden_dim, num_action_classes)
-        self.target_pos_head = MLPLayer(hidden_dim, hidden_dim, 2)
+        if use_aux_loss:
+            self.has_action_head = MLPLayer(hidden_dim, hidden_dim, 1)
+            self.has_target_pos_head = MLPLayer(hidden_dim, hidden_dim, 1)
+            self.action_class_head = MLPLayer(hidden_dim, hidden_dim, num_action_classes)
+            self.target_pos_head = MLPLayer(hidden_dim, hidden_dim, 2)
 
         # Optional action/target input embeddings for ablation
+        if use_action_target_input and not use_aux_loss:
+            raise ValueError(
+                "use_action_target_input requires use_aux_loss=True "
+                "(input pathway depends on auxiliary prediction heads)"
+            )
         self.use_action_target_input = use_action_target_input
-        if use_action_target_input:
+        if self.use_action_target_input:
             self.action_input_emb = nn.Embedding(num_action_classes, hidden_dim)
             self.target_input_emb = MLPLayer(2, hidden_dim, hidden_dim)
             self.aux_fusion = MLPLayer(hidden_dim * 3, hidden_dim, hidden_dim)
@@ -462,13 +470,7 @@ class SCAgentDecoder(nn.Module):
 
         next_token_logits = self.token_predict_head(feat_a)
 
-        # Auxiliary heads
-        has_action_logits = self.has_action_head(feat_a).squeeze(-1)  # [n_agent, 18]
-        has_target_pos_logits = self.has_target_pos_head(feat_a).squeeze(-1)  # [n_agent, 18]
-        action_class_logits = self.action_class_head(feat_a)  # [n_agent, 18, n_action]
-        target_pos_pred = self.target_pos_head(feat_a)  # [n_agent, 18, 2]
-
-        return {
+        out = {
             "next_token_logits": next_token_logits[:, 1:-1],  # [n_agent, 16, n_token]
             "next_token_valid": tokenized_agent["valid_mask"][:, 1:-1],
             "pred_pos": tokenized_agent["sampled_pos"],
@@ -480,16 +482,25 @@ class SCAgentDecoder(nn.Module):
             "gt_pos": tokenized_agent["gt_pos"],
             "gt_head": tokenized_agent["gt_heading"],
             "gt_valid": tokenized_agent["valid_mask"],
-            # Auxiliary predictions (steps 1:-1 → 16 steps, GT 2: → 16 steps)
-            "has_action_logits": has_action_logits[:, 1:-1],
-            "has_target_pos_logits": has_target_pos_logits[:, 1:-1],
-            "action_class_logits": action_class_logits[:, 1:-1],
-            "target_pos_pred": target_pos_pred[:, 1:-1],
-            "gt_has_action": tokenized_agent["has_action"][:, 2:],
-            "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
-            "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
-            "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
         }
+
+        if self.use_aux_loss:
+            has_action_logits = self.has_action_head(feat_a).squeeze(-1)
+            has_target_pos_logits = self.has_target_pos_head(feat_a).squeeze(-1)
+            action_class_logits = self.action_class_head(feat_a)
+            target_pos_pred = self.target_pos_head(feat_a)
+            out.update({
+                "has_action_logits": has_action_logits[:, 1:-1],
+                "has_target_pos_logits": has_target_pos_logits[:, 1:-1],
+                "action_class_logits": action_class_logits[:, 1:-1],
+                "target_pos_pred": target_pos_pred[:, 1:-1],
+                "gt_has_action": tokenized_agent["has_action"][:, 2:],
+                "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
+                "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
+                "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
+            })
+
+        return out
 
     def inference(
         self,
@@ -540,10 +551,11 @@ class SCAgentDecoder(nn.Module):
         pred_valid = tokenized_agent["valid_mask"].clone()
         next_token_logits_list = []
         next_token_action_list = []
-        aux_has_action_list = []
-        aux_has_target_pos_list = []
-        aux_action_list = []
-        aux_target_pos_list = []
+        if self.use_aux_loss:
+            aux_has_action_list = []
+            aux_has_target_pos_list = []
+            aux_action_list = []
+            aux_target_pos_list = []
         feat_a_t_dict = {}
 
         for t in range(n_step_future_2hz):
@@ -676,11 +688,12 @@ class SCAgentDecoder(nn.Module):
             next_token_logits_list.append(next_token_logits)
 
             # Auxiliary predictions at this rollout step
-            aux_has_action_list.append(self.has_action_head(feat_a_now).squeeze(-1))
-            aux_has_target_pos_list.append(self.has_target_pos_head(feat_a_now).squeeze(-1))
-            aux_action_logits = self.action_class_head(feat_a_now)
-            aux_action_list.append(aux_action_logits)
-            aux_target_pos_list.append(self.target_pos_head(feat_a_now))
+            if self.use_aux_loss:
+                aux_has_action_list.append(self.has_action_head(feat_a_now).squeeze(-1))
+                aux_has_target_pos_list.append(self.has_target_pos_head(feat_a_now).squeeze(-1))
+                aux_action_logits = self.action_class_head(feat_a_now)
+                aux_action_list.append(aux_action_logits)
+                aux_target_pos_list.append(self.target_pos_head(feat_a_now))
 
             next_token_idx, next_token_traj_all = (
                 sample_next_token_traj_contour(
@@ -795,16 +808,19 @@ class SCAgentDecoder(nn.Module):
             "gt_head": tokenized_agent["gt_heading"],
             "gt_valid": tokenized_agent["valid_mask"],
             "next_token_action": torch.stack(next_token_action_list, dim=1),
-            # Auxiliary predictions & GT
-            "has_action_logits": torch.stack(aux_has_action_list, dim=1),
-            "has_target_pos_logits": torch.stack(aux_has_target_pos_list, dim=1),
-            "action_class_logits": torch.stack(aux_action_list, dim=1),
-            "target_pos_pred": torch.stack(aux_target_pos_list, dim=1),
-            "gt_has_action": tokenized_agent["has_action"][:, 2:],
-            "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
-            "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
-            "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
         }
+
+        if self.use_aux_loss:
+            out_dict.update({
+                "has_action_logits": torch.stack(aux_has_action_list, dim=1),
+                "has_target_pos_logits": torch.stack(aux_has_target_pos_list, dim=1),
+                "action_class_logits": torch.stack(aux_action_list, dim=1),
+                "target_pos_pred": torch.stack(aux_target_pos_list, dim=1),
+                "gt_has_action": tokenized_agent["has_action"][:, 2:],
+                "gt_has_target_pos": tokenized_agent["has_target_pos"][:, 2:],
+                "gt_coarse_action": tokenized_agent["coarse_action"][:, 2:],
+                "gt_rel_target_pos": tokenized_agent["rel_target_pos"][:, 2:],
+            })
 
         if not self.training:
             out_dict["pred_traj_native"] = pred_traj_native
