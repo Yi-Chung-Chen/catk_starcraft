@@ -130,10 +130,15 @@ Adapts the SMART tokenized motion model for StarCraft II unit trajectory predict
 ### Map Encoder (`src/starcraft/modules/sc_map_encoder.py`)
 - CNN processes `[B, 3, 200, 200]` grid (pathing + height + creep) → `[B*625, hidden_dim]` patch tokens
 - 25×25 patches (8×8 cells each), connected to agents via radius-based pl2a attention
+- All 3 CNN input channels normalized to [-1, 1]:
+  - **Pathing**: raw inverted first (1=walkable, 0=blocked), padded with 0 (blocked), then *2-1
+  - **Height**: raw [0,255] → /255 to [0,1], padded with 0, then *2-1
+  - **Creep**: raw {0,1} already padded with 0 (no creep), then *2-1
 
 ### Coordinate System (important)
 - **Game coordinates**: X = column, Y increases upward from bottom
 - **Pathing grid**: Row 0 = top of map = **high Y** in game coordinates
+- **Pathing grid values**: SC2 raw API convention — **0 = walkable, 1 = blocked** (confirmed by placement grid overlap and neutral unit positions on pathing=1). Edges of map are all pathing=1.
 - **Patch positions**: Y is flipped from row index: `Y = H - (row_idx * 8 + 4)`
 - **Visualization**: `imshow` with `origin="upper"` and `extent=[0, W, 0, H]`
 

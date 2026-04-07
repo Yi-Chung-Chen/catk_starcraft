@@ -97,7 +97,10 @@ class SCTokenProcessor(torch.nn.Module):
             pathing = torch.from_numpy(f["pathing_grid"][:].astype("float32"))  # [H, W]
             height = torch.from_numpy(f["height_map"][:].astype("float32"))     # [H, W]
 
-        # Normalize: pathing stays 0/1, height to [-1, 1]
+        # Invert pathing: raw SC2 API uses 0 = walkable, 1 = blocked.
+        # We flip to 1 = walkable, 0 = blocked so padding (0) = blocked.
+        pathing = 1.0 - pathing
+        # Height normalized to [-1, 1] before padding so pad=0 is neutral midpoint.
         height = height / 255.0 * 2.0 - 1.0
         grid = torch.stack([pathing, height], dim=0)  # [2, H, W]
         H, W = grid.shape[1], grid.shape[2]
@@ -105,8 +108,11 @@ class SCTokenProcessor(torch.nn.Module):
         # Valid mask before padding (marks original area)
         valid_2d = torch.ones(H, W, dtype=torch.bool)
 
-        # Pad to (_PADDED_SIZE, _PADDED_SIZE)
+        # Pad: pathing 0 = blocked, height 0 = neutral midpoint
         grid = F.pad(grid, (0, _PADDED_SIZE - W, 0, _PADDED_SIZE - H), value=0.0)
+
+        # Normalize pathing channel to [-1, 1]; height already in [-1, 1]
+        grid[0] = grid[0] * 2.0 - 1.0
         valid_2d = F.pad(valid_2d, (0, _PADDED_SIZE - W, 0, _PADDED_SIZE - H), value=False)
 
         # Per-patch valid mask (25x25): valid if any cell in the 8x8 patch is in original area
@@ -152,8 +158,10 @@ class SCTokenProcessor(torch.nn.Module):
         for i, name in enumerate(map_names):
             m = self._load_and_preprocess_map(name)
             static_grid = m["map_grid"]  # [2, 200, 200]
-            # Concatenate creep as 3rd channel
-            grids.append(torch.cat([static_grid, creep_batch[i].unsqueeze(0)], dim=0))  # [3, 200, 200]
+            # Concatenate creep as 3rd channel (already 0/1, padded with 0),
+            # then normalize to [-1, 1]
+            creep_ch = creep_batch[i].unsqueeze(0) * 2.0 - 1.0
+            grids.append(torch.cat([static_grid, creep_ch], dim=0))  # [3, 200, 200]
             positions.append(m["position"])
             valid_masks.append(m["valid_mask"])
             batch_indices.append(torch.full((n_patches,), i, dtype=torch.long))
