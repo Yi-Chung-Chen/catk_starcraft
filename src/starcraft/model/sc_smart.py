@@ -91,23 +91,26 @@ class SCSMART(LightningModule):
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
+        train_mask = data["agent"]["train_mask"]
+
         if self.val_open_loop:
             pred = self.encoder(tokenized_map, tokenized_agent)
             loss = self.training_loss(
                 **pred,
                 token_agent_shape=tokenized_agent["token_agent_shape"],
                 token_traj=tokenized_agent["token_traj"],
+                train_mask=train_mask,
             )
             if self.use_aux_loss:
-                self.action_target_loss(**pred)
+                self.action_target_loss(**pred, train_mask=train_mask)
                 for k, v in self.action_target_loss.batch_components().items():
                     self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
 
             self.TokenCls.update(
                 pred=pred["next_token_logits"],
-                pred_valid=pred["next_token_valid"],
+                pred_valid=pred["next_token_valid"] & train_mask.unsqueeze(1),
                 target=tokenized_agent["gt_idx"][:, 2:],
-                target_valid=tokenized_agent["valid_mask"][:, 2:],
+                target_valid=tokenized_agent["valid_mask"][:, 2:] & train_mask.unsqueeze(1),
             )
             self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
@@ -136,6 +139,7 @@ class SCSMART(LightningModule):
             target_valid = (
                 data["agent"]["valid_mask"][:, self.num_historical_steps :]
                 & alive_at_current.unsqueeze(1)
+                & train_mask.unsqueeze(1)
             )
 
             self.minADE.update(

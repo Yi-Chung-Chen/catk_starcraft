@@ -81,13 +81,15 @@ class SCCrossEntropy(Metric):
         )
 
         loss_weighting_mask = next_token_valid & euclidean_target_valid
-        if self.training:
+        if train_mask is not None:
             loss_weighting_mask &= train_mask.unsqueeze(1)
 
         self.loss_sum += (loss * loss_weighting_mask).sum()
         self.count += (loss_weighting_mask > 0).sum()
 
     def compute(self) -> Tensor:
+        if self.count == 0:
+            return self.loss_sum.new_tensor(0.0)
         return self.loss_sum / self.count
 
 

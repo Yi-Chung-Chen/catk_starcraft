@@ -7,7 +7,6 @@ num_workers: 4
 shuffle: true
 pin_memory: true
 persistent_workers: true
-train_max_num: 64
 min_future_alive: 8
 train_map_names:
   - Abyssal_Reef_LE

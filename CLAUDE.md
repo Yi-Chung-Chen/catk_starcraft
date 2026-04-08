@@ -126,6 +126,7 @@ Adapts the SMART tokenized motion model for StarCraft II unit trajectory predict
   - `target_id` and `target_pos` are mutually exclusive in the data
 - **Token processor** (`src/starcraft/tokens/sc_token_processor.py`): Tokenizes agent trajectories and loads static map data
   - Map data cached per map_name (7 maps), loaded from `datasets/map_data/static/{Map_Name}.h5`
+- **Target builder** (`src/starcraft/datamodules/sc_target_builder.py`): `train_mask` selects only **movable player units** (not static buildings, not neutrals) for the loss. All agents remain in the attention graph as context. No max_num cap — movable player unit counts are naturally manageable (~30-40 per scenario).
 
 ### Map Encoder (`src/starcraft/modules/sc_map_encoder.py`)
 - CNN processes `[B, 3, 200, 200]` grid (pathing + height + creep) → `[B*625, hidden_dim]` patch tokens

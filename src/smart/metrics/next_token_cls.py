@@ -38,4 +38,6 @@ class TokenCls(Metric):
         self.count += valid_mask.sum()
 
     def compute(self) -> torch.Tensor:
+        if self.count == 0:
+            return self.sum.new_tensor(0.0)
         return self.sum / self.count

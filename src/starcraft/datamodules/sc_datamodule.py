@@ -22,7 +22,6 @@ class SCDataModule(LightningDataModule):
         num_workers: int,
         pin_memory: bool,
         persistent_workers: bool,
-        train_max_num: int,
         min_future_alive: int = 8,
         train_map_names: Optional[List[str]] = None,
         val_map_names: Optional[List[str]] = None,
@@ -37,13 +36,12 @@ class SCDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
-        self.train_max_num = train_max_num
         self.min_future_alive = min_future_alive
         self.train_map_names = train_map_names
         self.val_map_names = val_map_names
         self.test_map_names = test_map_names
 
-        self.train_transform = SCTargetBuilderTrain(train_max_num, min_future_alive)
+        self.train_transform = SCTargetBuilderTrain(min_future_alive)
         self.val_transform = SCTargetBuilderVal()
         self.test_transform = SCTargetBuilderVal()
 

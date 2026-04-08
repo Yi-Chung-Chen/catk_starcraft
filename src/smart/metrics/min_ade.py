@@ -39,4 +39,6 @@ class minADE(Metric):
         self.count += target_valid.any(-1).sum()
 
     def compute(self) -> torch.Tensor:
+        if self.count == 0:
+            return self.sum.new_tensor(0.0)
         return self.sum / self.count

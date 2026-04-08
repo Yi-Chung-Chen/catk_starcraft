@@ -56,7 +56,7 @@ class SCActionTargetLoss(Metric):
         **kwargs,
     ) -> None:
         valid = next_token_valid
-        if self.training and train_mask is not None:
+        if train_mask is not None:
             valid = valid & train_mask.unsqueeze(1)
 
         n_valid = valid.sum()
@@ -117,6 +117,8 @@ class SCActionTargetLoss(Metric):
         }
 
     def compute(self) -> Tensor:
+        if self.count == 0:
+            return self.loss_sum.new_tensor(0.0)
         return self.loss_sum / self.count
 
     def batch_components(self) -> Dict[str, Tensor]:
