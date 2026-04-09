@@ -40,6 +40,7 @@ class SCAgentDecoder(nn.Module):
         num_concepts: int = 16,
         use_aux_loss: bool = True,
         use_action_target_input: bool = False,
+        closed_loop_oracle_intent_input: bool = False,
         num_action_classes: int = 11,
     ) -> None:
         super().__init__()
@@ -159,12 +160,19 @@ class SCAgentDecoder(nn.Module):
             self.target_pos_head = MLPLayer(hidden_dim, hidden_dim, 2)
 
         # Optional action/target input embeddings for ablation
-        if use_action_target_input and not use_aux_loss:
+        if closed_loop_oracle_intent_input and not use_action_target_input:
             raise ValueError(
-                "use_action_target_input requires use_aux_loss=True "
-                "(input pathway depends on auxiliary prediction heads)"
+                "closed_loop_oracle_intent_input requires use_action_target_input=True "
+                "(needs action/target input embedding layers)"
+            )
+        if use_action_target_input and not use_aux_loss and not closed_loop_oracle_intent_input:
+            raise ValueError(
+                "use_action_target_input requires use_aux_loss=True when "
+                "closed_loop_oracle_intent_input is False "
+                "(predicted variant needs auxiliary prediction heads)"
             )
         self.use_action_target_input = use_action_target_input
+        self.closed_loop_oracle_intent_input = closed_loop_oracle_intent_input
         if self.use_action_target_input:
             self.action_input_emb = nn.Embedding(num_action_classes, hidden_dim)
             self.target_input_emb = MLPLayer(2, hidden_dim, hidden_dim)
@@ -775,18 +783,32 @@ class SCAgentDecoder(nn.Module):
             feat_a_next = torch.cat((agent_token_emb_next, x_a), dim=-1).unsqueeze(1)
             feat_a_next = self.fusion_emb(feat_a_next)
 
-            # Feed predicted action/target back as input for next step
+            # Feed action/target as input for next step
             if self.use_action_target_input:
-                has_action_pred = (aux_has_action_list[-1] > 0)  # [n_agent]
-                action_pred = aux_action_logits.argmax(-1)  # [n_agent]
-                # Zero embedding for idle units (has_action=False)
-                action_emb_next = self.action_input_emb(action_pred)  # [n_agent, hidden_dim]
-                action_emb_next[~has_action_pred] = 0.0
+                if self.closed_loop_oracle_intent_input:
+                    # Oracle: use GT intent at step n_step (the position being appended)
+                    oracle_action = tokenized_agent["coarse_action"][:, n_step]
+                    oracle_has_action = tokenized_agent["has_action"][:, n_step]
+                    oracle_target_pos = tokenized_agent["rel_target_pos"][:, n_step]
+                    oracle_has_tp = tokenized_agent["has_target_pos"][:, n_step]
 
-                has_tp_pred = (aux_has_target_pos_list[-1] > 0)  # [n_agent]
-                target_pred = aux_target_pos_list[-1].clone()  # [n_agent, 2]
-                target_pred[~has_tp_pred] = 0.0
-                target_emb_next = self.target_input_emb(target_pred)  # [n_agent, hidden_dim]
+                    action_emb_next = self.action_input_emb(oracle_action.long())
+                    action_emb_next[~oracle_has_action] = 0.0
+
+                    target_pos = oracle_target_pos.clone()
+                    target_pos[~oracle_has_tp] = 0.0
+                    target_emb_next = self.target_input_emb(target_pos)
+                else:
+                    # Predicted: use aux head predictions from current step
+                    has_action_pred = (aux_has_action_list[-1] > 0)  # [n_agent]
+                    action_pred = aux_action_logits.argmax(-1)  # [n_agent]
+                    action_emb_next = self.action_input_emb(action_pred)  # [n_agent, hidden_dim]
+                    action_emb_next[~has_action_pred] = 0.0
+
+                    has_tp_pred = (aux_has_target_pos_list[-1] > 0)  # [n_agent]
+                    target_pred = aux_target_pos_list[-1].clone()  # [n_agent, 2]
+                    target_pred[~has_tp_pred] = 0.0
+                    target_emb_next = self.target_input_emb(target_pred)  # [n_agent, hidden_dim]
 
                 feat_a_next = self.aux_fusion(
                     torch.cat([feat_a_next, action_emb_next.unsqueeze(1), target_emb_next.unsqueeze(1)], dim=-1)

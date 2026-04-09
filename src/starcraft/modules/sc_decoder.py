@@ -31,6 +31,7 @@ class SCDecoder(nn.Module):
         num_concepts: int = 16,
         use_aux_loss: bool = True,
         use_action_target_input: bool = False,
+        closed_loop_oracle_intent_input: bool = False,
         num_action_classes: int = 11,
     ) -> None:
         super().__init__()
@@ -58,6 +59,7 @@ class SCDecoder(nn.Module):
             num_concepts=num_concepts,
             use_aux_loss=use_aux_loss,
             use_action_target_input=use_action_target_input,
+            closed_loop_oracle_intent_input=closed_loop_oracle_intent_input,
             num_action_classes=num_action_classes,
         )
 
