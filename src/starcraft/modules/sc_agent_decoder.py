@@ -63,6 +63,7 @@ class SCAgentDecoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(NUM_UNIT_TYPES, hidden_dim)
         self.unit_state_emb = nn.Embedding(4, hidden_dim)  # grounded/flying/burrowed/carried
+        self.owner_emb = nn.Embedding(3, hidden_dim)  # 0=P1, 1=P2, 2=neutral
         self.unit_props_emb = MLPLayer(4, hidden_dim, hidden_dim)  # radius, health, shield, energy
 
         self.x_a_emb = FourierEmbedding(
@@ -188,6 +189,7 @@ class SCAgentDecoder(nn.Module):
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
         unit_state,  # [n_agent]
+        owner_idx,  # [n_agent] 0=P1, 1=P2, 2=neutral
         unit_props,  # [n_agent, 4] (radius, health, shield, energy)
         inference=False,
         prev_action=None,  # [n_agent, n_step] coarse action class
@@ -216,9 +218,17 @@ class SCAgentDecoder(nn.Module):
             ],
             dim=-1,
         )  # [n_agent, n_step, 2]
+        # Symmetry: randomly swap P1/P2 embedding indices during training
+        owner_for_emb = owner_idx
+        if self.training and torch.rand(1).item() < 0.5:
+            owner_for_emb = owner_idx.clone()
+            owner_for_emb[owner_idx == 0] = 1
+            owner_for_emb[owner_idx == 1] = 0
+
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
             self.unit_state_emb(unit_state.long()),
+            self.owner_emb(owner_for_emb.long()),
             self.unit_props_emb(unit_props),
         ]
 
@@ -403,6 +413,7 @@ class SCAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
             unit_state=tokenized_agent["unit_state"],
+            owner_idx=tokenized_agent["owner_idx"],
             unit_props=tokenized_agent["unit_props"],
             prev_action=tokenized_agent.get("coarse_action"),
             prev_target_pos=tokenized_agent.get("rel_target_pos"),
@@ -535,6 +546,7 @@ class SCAgentDecoder(nn.Module):
                 head_vector_a=head_vector_a,
                 agent_type=tokenized_agent["type"],
                 unit_state=tokenized_agent["unit_state"],
+                owner_idx=tokenized_agent["owner_idx"],
                 unit_props=tokenized_agent["unit_props"],
                 inference=True,
                 prev_action=tokenized_agent["coarse_action"][:, :step_current_2hz] if self.use_action_target_input else None,

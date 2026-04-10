@@ -194,6 +194,7 @@ class SCTokenProcessor(torch.nn.Module):
             "batch": data["agent"]["batch"],
             # Ownership and visibility for fog-of-war edge filtering
             "owner": data["agent"]["owner"],  # [n_agent]
+            "owner_idx": self._remap_owner(data["agent"]["owner"]),  # [n_agent] 0=P1,1=P2,2=neutral
             "unit_state": data["agent"]["unit_state"],  # [n_agent]
             "unit_props": torch.cat([
                 radius.unsqueeze(-1),            # [n_agent, 1]
@@ -365,6 +366,14 @@ class SCTokenProcessor(torch.nn.Module):
                 heading[i, t - n_fill : t] = heading[i, t]
 
         return valid, pos, heading
+
+    @staticmethod
+    def _remap_owner(owner: Tensor) -> Tensor:
+        """Remap raw owner values (1=P1, 2=P2, 16=neutral) to contiguous indices (0, 1, 2)."""
+        idx = torch.zeros_like(owner)
+        idx[owner == 2] = 1
+        idx[owner == 16] = 2
+        return idx
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
