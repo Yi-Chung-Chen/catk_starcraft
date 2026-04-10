@@ -146,7 +146,7 @@ Adapts the SMART tokenized motion model for StarCraft II unit trajectory predict
 ### Auxiliary Prediction Heads (when `use_aux_loss=true`)
 Four heads in `sc_agent_decoder.py`: `has_action`, `has_target_pos`, `action_class` (11 classes), `target_pos` (2D XY)
 - Loss in `src/starcraft/metrics/sc_action_target_loss.py`
-- `use_action_target_input` feeds predictions back as input (requires `use_aux_loss=true`)
+- `decoder.use_action_target_input` feeds predictions back as input (requires `use_aux_loss=true`)
 
 ### Visualization (`src/starcraft/utils/vis_starcraft.py`)
 - Animated GIFs showing GT + predicted trajectories
