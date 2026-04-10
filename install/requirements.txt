@@ -5,9 +5,11 @@ lightning==2.4.0 # Apache License 2.0: https://github.com/Lightning-AI/pytorch-l
 torchmetrics==1.4.1 # Apache License 2.0: https://github.com/Lightning-AI/torchmetrics/blob/master/LICENSE
 pandas==2.2.2 # BSD 3-Clause License: https://github.com/pandas-dev/pandas/blob/main/LICENSE
 scikit-learn==1.5.1 # BSD 3-Clause License: https://github.com/scikit-learn/scikit-learn/blob/main/COPYING
+numpy==1.23.5 # BSD 3-Clause License: https://github.com/numpy/numpy/blob/main/LICENSE.txt
 
 # visualization
 opencv-python-headless==4.10.0.84 # MIT License: https://github.com/opencv/opencv-python/blob/master/LICENSE.txt
+matplotlib # PSF License: https://github.com/matplotlib/matplotlib/blob/main/LICENSE
 
 # for waymo dataset
 tensorboard==2.12.3 # Apache License 2.0: https://github.com/tensorflow/tensorboard/blob/master/LICENSE
