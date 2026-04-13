@@ -66,6 +66,8 @@ class ConceptAttentionLayer(nn.Module):
         pos_q: Tensor,
         neutral_mask: Tensor,
         num_concepts_total: int,
+        frozen_feat: Tensor = None,
+        s1_is_cross_player: Tensor = None,
     ) -> Tensor:
         """Apply concept attention.
 
@@ -89,7 +91,14 @@ class ConceptAttentionLayer(nn.Module):
         concepts = concepts.reshape(num_concepts_total, self.hidden_dim)
 
         # Stage 1: concepts aggregate from visible units
-        concepts = self.s1_attn((feat_a, concepts), r_s1, edge_index_s1)
+        # Cross-player sources use frozen initial features to prevent info leakage
+        if frozen_feat is not None and s1_is_cross_player is not None:
+            combined_src = torch.cat([feat_a, frozen_feat], dim=0)
+            edge_index_s1 = edge_index_s1.clone()
+            edge_index_s1[0, s1_is_cross_player] += feat_a.shape[0]
+            concepts = self.s1_attn((combined_src, concepts), r_s1, edge_index_s1)
+        else:
+            concepts = self.s1_attn((feat_a, concepts), r_s1, edge_index_s1)
 
         # Stage 2: owned units attend to concepts (pos on Q)
         feat_a_before = feat_a
@@ -171,6 +180,11 @@ class ConceptAttentionLayer(nn.Module):
             torch.cat([src_1, src_2]),
             torch.cat([dst_1, dst_2]),
         ])
+
+        # Cross-player mask: source unit not owned by the concept's player
+        cross_p1 = (owner[a1] != 1).repeat_interleave(K)  # P2/neutral → P1 concepts
+        cross_p2 = (owner[a2] != 2).repeat_interleave(K)  # P1/neutral → P2 concepts
+        s1_is_cross_player = torch.cat([cross_p1, cross_p2])
 
         # --- Stage 1 positional encoding (per-edge) ---
         # For P1 edges: pos relative to P1's start; for P2: relative to P2's start
@@ -263,4 +277,5 @@ class ConceptAttentionLayer(nn.Module):
             "pos_q": pos_q,
             "neutral_mask": neutral_mask,
             "num_concepts_total": num_concepts_total,
+            "s1_is_cross_player": s1_is_cross_player,
         }

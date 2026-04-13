@@ -131,6 +131,19 @@ class SCAgentDecoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.cross_player_attn_layers = nn.ModuleList(
+            [
+                AttentionLayer(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    dropout=dropout,
+                    bipartite=True,
+                    has_pos_emb=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         if num_concepts > 0:
             self.concept_pos_emb = FourierEmbedding(
                 input_dim=3, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands
@@ -256,7 +269,7 @@ class SCAgentDecoder(nn.Module):
             return feat_a, agent_token_emb, agent_token_emb_all, categorical_embs
         return feat_a
 
-    def build_temporal_edge(self, pos_a, head_a, head_vector_a, mask, inference_mask=None):
+    def build_temporal_edge(self, pos_a, head_a, head_vector_a, mask, owner=None, inference_mask=None):
         pos_t = pos_a.flatten(0, 1)
         head_t = head_a.flatten(0, 1)
         head_vector_t = head_vector_a.flatten(0, 1)
@@ -266,6 +279,11 @@ class SCAgentDecoder(nn.Module):
                 torch.ones_like(mask) * (1 - self.hist_drop_prob)
             ).bool()
             mask = mask & _mask_keep
+
+        # Exclude neutral units from temporal attention
+        if owner is not None:
+            mask = mask.clone()
+            mask[owner == 16] = False
 
         if inference_mask is not None:
             mask_t = mask.unsqueeze(2) & inference_mask.unsqueeze(1)
@@ -295,11 +313,18 @@ class SCAgentDecoder(nn.Module):
         return edge_index_t, r_t
 
     def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask,
-                               owner=None, visible_status=None):
+                               owner=None):
         mask = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+
+        # Exclude neutral units from same-player a2a
+        if owner is not None:
+            n_step_local = pos_a.shape[1]
+            neutral_s = (owner == 16).unsqueeze(0).expand(n_step_local, -1).reshape(-1)
+            mask = mask & ~neutral_s
+
         edge_index_a2a = radius_graph(
             x=pos_s[:, :2],
             r=self.a2a_radius,
@@ -309,25 +334,12 @@ class SCAgentDecoder(nn.Module):
         )
         edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
 
-        # Fog-of-war visibility filtering: observer's player must currently see the source unit
-        if owner is not None and visible_status is not None:
-            n_step = pos_a.shape[1]
-            owner_s = owner.unsqueeze(0).expand(n_step, -1).reshape(-1)
-            vis_s = visible_status.transpose(0, 1).reshape(-1).to(edge_index_a2a.device)
-
-            src = edge_index_a2a[0]
-            tgt = edge_index_a2a[1]
-            obs_owner = owner_s[tgt]
-            src_vs = vis_s[src]
-            p1_state = src_vs // 3
-            p2_state = src_vs % 3
-
-            vis_ok = torch.ones(src.shape[0], dtype=torch.bool, device=src.device)
-            vis_ok[obs_owner == 1] = (p1_state[obs_owner == 1] == 2)
-            vis_ok[obs_owner == 2] = (p2_state[obs_owner == 2] == 2)
-            # Neutral observers (owner=16): vis_ok stays True
-
-            edge_index_a2a = edge_index_a2a[:, vis_ok]
+        # Same-player only: keep edges where src and tgt belong to the same player
+        if owner is not None:
+            n_step_local = pos_a.shape[1]
+            owner_s = owner.unsqueeze(0).expand(n_step_local, -1).reshape(-1)
+            same_player = owner_s[edge_index_a2a[0]] == owner_s[edge_index_a2a[1]]
+            edge_index_a2a = edge_index_a2a[:, same_player]
 
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
@@ -356,9 +368,14 @@ class SCAgentDecoder(nn.Module):
         mask,            # [n_agent, n_step]
         batch_s,         # [n_agent*n_step]
         batch_pl,        # [n_pl*n_step]
+        owner=None,      # [n_agent] raw ownership (1, 2, 16)
     ):
         n_step = pos_a.shape[1]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
+        # Exclude neutral units from map-to-agent attention
+        if owner is not None:
+            neutral_s = (owner == 16).unsqueeze(0).expand(n_step, -1).reshape(-1)
+            mask_pl2a = mask_pl2a & ~neutral_s
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
@@ -395,6 +412,65 @@ class SCAgentDecoder(nn.Module):
         r_pl2a = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
         return edge_index_pl2a, r_pl2a
 
+    def build_cross_player_edge(self, pos_a, head_a, head_vector_a, batch_s, mask,
+                                owner, visible_status):
+        """Build cross-player edges with fog-of-war. Source=frozen, target=player units.
+
+        Edges: P1↔P2, P1↔Neutral(src), P2↔Neutral(src). Neutrals are source-only.
+        Uses step-major layout matching a2a edges.
+        """
+        n_agent, n_step = pos_a.shape[:2]
+        mask_s = mask.transpose(0, 1).reshape(-1)
+        pos_s = pos_a.transpose(0, 1).flatten(0, 1)
+        head_s = head_a.transpose(0, 1).reshape(-1)
+        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+        owner_s = owner.unsqueeze(0).expand(n_step, -1).reshape(-1)
+        vis_s = visible_status.transpose(0, 1).reshape(-1).to(pos_s.device)
+
+        edge_index = radius_graph(
+            x=pos_s[:, :2],
+            r=self.a2a_radius,
+            batch=batch_s,
+            loop=False,
+            max_num_neighbors=300,
+        )
+        edge_index = subgraph(subset=mask_s, edge_index=edge_index)[0]
+
+        src = edge_index[0]
+        tgt = edge_index[1]
+        src_owner = owner_s[src]
+        tgt_owner = owner_s[tgt]
+
+        # Cross-player: different owners, target must be player (not neutral)
+        cross = (src_owner != tgt_owner) & (tgt_owner != 16)
+
+        # Fog-of-war: observer (target) must currently see the source unit
+        src_vs = vis_s[src]
+        p1_state = src_vs // 3
+        p2_state = src_vs % 3
+        vis_ok = torch.ones(src.shape[0], dtype=torch.bool, device=src.device)
+        vis_ok[tgt_owner == 1] = (p1_state[tgt_owner == 1] == 2)
+        vis_ok[tgt_owner == 2] = (p2_state[tgt_owner == 2] == 2)
+
+        edge_index_cross = edge_index[:, cross & vis_ok]
+
+        # Edge features: [distance, bearing, heading_diff]
+        rel_pos = pos_s[edge_index_cross[0]] - pos_s[edge_index_cross[1]]
+        rel_head = wrap_angle(head_s[edge_index_cross[0]] - head_s[edge_index_cross[1]])
+        r_cross = torch.stack(
+            [
+                torch.norm(rel_pos[:, :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_s[edge_index_cross[1]],
+                    nbr_vector=rel_pos[:, :2],
+                ),
+                rel_head,
+            ],
+            dim=-1,
+        )
+        r_cross = self.r_a2a_emb(continuous_inputs=r_cross, categorical_embs=None)
+        return edge_index_cross, r_cross
+
     def forward(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -420,8 +496,13 @@ class SCAgentDecoder(nn.Module):
             prev_has_action=tokenized_agent.get("has_action"),
         )
 
+        # Frozen initial features for cross-player attention (step-major view).
+        # feat_a is reassigned (not mutated) in the loop, so this view stays frozen.
+        feat_a_initial_s = feat_a.transpose(0, 1).flatten(0, 1)
+
         edge_index_t, r_t = self.build_temporal_edge(
-            pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a, mask=mask
+            pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a, mask=mask,
+            owner=tokenized_agent["owner"],
         )
 
         batch_s = torch.cat(
@@ -436,7 +517,6 @@ class SCAgentDecoder(nn.Module):
             pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
             batch_s=batch_s, mask=mask,
             owner=tokenized_agent["owner"],
-            visible_status=tokenized_agent["visible_status"],
         )
 
         batch_pl = torch.cat(
@@ -452,6 +532,15 @@ class SCAgentDecoder(nn.Module):
             valid_pl=map_feature["valid_mask"],
             pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
             mask=mask, batch_s=batch_s, batch_pl=batch_pl,
+            owner=tokenized_agent["owner"],
+        )
+
+        # Cross-player edges (frozen source → player targets)
+        edge_index_cross, r_cross = self.build_cross_player_edge(
+            pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
+            batch_s=batch_s, mask=mask,
+            owner=tokenized_agent["owner"],
+            visible_status=tokenized_agent["visible_status"],
         )
 
         feat_map = (
@@ -482,9 +571,12 @@ class SCAgentDecoder(nn.Module):
                 (feat_map, feat_a), r_pl2a, edge_index_pl2a
             )
             feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = self.cross_player_attn_layers[i](
+                (feat_a_initial_s, feat_a), r_cross, edge_index_cross
+            )
             # feat_a is [n_step*n_agent, hidden_dim] (step-major)
             if self.num_concepts > 0:
-                feat_a = self.concept_attn_layers[i](feat_a, **concept_edge_data)
+                feat_a = self.concept_attn_layers[i](feat_a, **concept_edge_data, frozen_feat=feat_a_initial_s)
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
 
         next_token_logits = self.token_predict_head(feat_a)
@@ -602,6 +694,7 @@ class SCAgentDecoder(nn.Module):
                 edge_index_t, r_t = self.build_temporal_edge(
                     pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
                     mask=pred_valid[:, :n_step],
+                    owner=tokenized_agent["owner"],
                 )
             else:
                 hist_step = 1
@@ -612,6 +705,7 @@ class SCAgentDecoder(nn.Module):
                 edge_index_t, r_t = self.build_temporal_edge(
                     pos_a=pos_a, head_a=head_a, head_vector_a=head_vector_a,
                     mask=pred_valid[:, :n_step],
+                    owner=tokenized_agent["owner"],
                     inference_mask=inference_mask,
                 )
                 edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
@@ -626,6 +720,7 @@ class SCAgentDecoder(nn.Module):
                 mask=inference_mask[:, -hist_step:],
                 batch_s=batch_s,
                 batch_pl=batch_pl,
+                owner=tokenized_agent["owner"],
             )
             edge_index_a2a, r_a2a = self.build_interaction_edge(
                 pos_a=pos_a[:, -hist_step:],
@@ -634,8 +729,22 @@ class SCAgentDecoder(nn.Module):
                 batch_s=batch_s,
                 mask=inference_mask[:, -hist_step:],
                 owner=tokenized_agent["owner"],
-                visible_status=tokenized_agent["visible_status"][:, n_step - hist_step:n_step],
             )
+
+            # Cross-player edges and frozen source features (same hist_step window)
+            vis_idx_end = min(n_step, 18)
+            vis_idx_start = vis_idx_end - hist_step
+            edge_index_cross, r_cross = self.build_cross_player_edge(
+                pos_a=pos_a[:, -hist_step:],
+                head_a=head_a[:, -hist_step:],
+                head_vector_a=head_vector_a[:, -hist_step:],
+                batch_s=batch_s,
+                mask=pred_valid[:, n_step - hist_step:n_step] if t == 0 else inference_mask[:, -hist_step:],
+                owner=tokenized_agent["owner"],
+                visible_status=tokenized_agent["visible_status"][:, vis_idx_start:vis_idx_end],
+            )
+            # Frozen source: initial embeddings from feat_a (never overwritten by attention)
+            feat_cross_src = feat_a[:, -hist_step:].transpose(0, 1).flatten(0, 1)
 
             # Build concept attention edges for this rollout step
             if self.num_concepts > 0:
@@ -674,10 +783,13 @@ class SCAgentDecoder(nn.Module):
                     _feat_temporal = self.a2a_attn_layers[i](
                         _feat_temporal, r_a2a, edge_index_a2a
                     )
+                    _feat_temporal = self.cross_player_attn_layers[i](
+                        (feat_cross_src, _feat_temporal), r_cross, edge_index_cross
+                    )
                     # _feat_temporal is [n_step*n_agent, d] (step-major)
                     if self.num_concepts > 0:
                         _feat_temporal = self.concept_attn_layers[i](
-                            _feat_temporal, **concept_edge_data
+                            _feat_temporal, **concept_edge_data, frozen_feat=feat_cross_src
                         )
                     _feat_temporal = _feat_temporal.view(n_step, n_agent, -1).transpose(0, 1)
                     feat_a_now = _feat_temporal[:, -1]
@@ -694,10 +806,13 @@ class SCAgentDecoder(nn.Module):
                     feat_a_now = self.a2a_attn_layers[i](
                         feat_a_now, r_a2a, edge_index_a2a
                     )
+                    feat_a_now = self.cross_player_attn_layers[i](
+                        (feat_cross_src, feat_a_now), r_cross, edge_index_cross
+                    )
                     # feat_a_now is [n_agent, d] (single timestep)
                     if self.num_concepts > 0:
                         feat_a_now = self.concept_attn_layers[i](
-                            feat_a_now, **concept_edge_data
+                            feat_a_now, **concept_edge_data, frozen_feat=feat_cross_src
                         )
                     if i + 1 < self.num_layers:
                         feat_a_t_dict[i + 1] = torch.cat(
