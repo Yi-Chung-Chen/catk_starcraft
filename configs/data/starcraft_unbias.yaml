@@ -1,0 +1,17 @@
+defaults:
+  - starcraft
+
+dataset_root: ${paths.root_dir}/datasets/StarCraftMotion_split_v2_medium
+
+train_map_names:
+  - Abyssal_Reef_LE
+  - Acolyte_LE
+  - Ascension_to_Aiur_LE
+  - Catallena_LE_(Void)
+  - Interloper_LE
+val_map_names:
+  - Abyssal_Reef_LE
+  - Acolyte_LE
+  - Ascension_to_Aiur_LE
+  - Catallena_LE_(Void)
+  - Interloper_LE

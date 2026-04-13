@@ -1,7 +1,18 @@
 #!/bin/sh
+# Usage: bash scripts/local_val_sc.sh [dataset]
+#   dataset: adv (default), unbias
+
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
+
+DATASET=${1:-adv}
+
+if [ "$DATASET" = "unbias" ]; then
+  DATA_OVERRIDES="data=starcraft_unbias"
+else
+  DATA_OVERRIDES=""
+fi
 
 MY_EXPERIMENT="sc_pre_bc"
 MY_TASK_NAME="sc_closed_val_eval"
@@ -14,6 +25,8 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate catk
 
 # Local StarCraft closed-loop validation on a single GPU.
+echo "=== local_val_sc.sh | dataset=$DATASET ==="
+
 python \
   -m src.run \
   action=validate \
@@ -29,6 +42,7 @@ python \
   model.model_config.n_vis_batch=125 \
   model.model_config.n_vis_scenario=4 \
   trainer.limit_val_batches=125 \
-  task_name=$MY_TASK_NAME
+  task_name=$MY_TASK_NAME \
+  $DATA_OVERRIDES
 
 echo "bash local_val_sc.sh done!"

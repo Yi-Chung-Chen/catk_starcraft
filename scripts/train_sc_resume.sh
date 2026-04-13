@@ -1,22 +1,19 @@
 #!/bin/sh
+# Usage: bash scripts/train_sc_resume.sh [dataset]
+#   dataset: adv (default), unbias
+
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# ---------------------------------------------------------------
-# StarCraft Motion — BC Pre-training
-#
-# Uses experiment=sc_pre_bc which sets:
-#   data=starcraft          (SCDataModule, HDF5 scenario files)
-#   model=sc_smart          (SCSMART, 128-dim / 8-head / 6-layer)
-#   action=fit
-#   lr=5e-4, max_epochs=64
-#
-# Paths (edit in configs/paths/default.yaml or override here):
-#   sc_dataset_root  — root of StarCraftMotion_split_v1_medium
-#   sc_motion_dict   — path to motion_dictionary.pkl
-# ---------------------------------------------------------------
+DATASET=${1:-adv}
+
+if [ "$DATASET" = "unbias" ]; then
+  DATA_OVERRIDES="data=starcraft_unbias"
+else
+  DATA_OVERRIDES=""
+fi
 
 MY_EXPERIMENT="sc_pre_bc"
 MY_TASK_NAME=$MY_EXPERIMENT"-debug"
@@ -33,7 +30,8 @@ torchrun --nproc_per_node=gpu \
   data.val_batch_size=8 \
   data.test_batch_size=8 \
   trainer.max_epochs=10 \
-  ckpt_path=logs/sc_pre_bc-debug/runs/2026-03-31_16-46-54/checkpoints/last.ckpt
+  ckpt_path=logs/sc_pre_bc-debug/runs/2026-03-31_16-46-54/checkpoints/last.ckpt \
+  $DATA_OVERRIDES
 
 # Multi-GPU DDP (uncomment for multi-GPU or multi-node):
 # torchrun \

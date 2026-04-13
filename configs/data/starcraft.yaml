@@ -12,12 +12,12 @@ train_map_names:
   - Abyssal_Reef_LE
   - Acolyte_LE
   - Ascension_to_Aiur_LE
-  - Catallena_LE_(Void)
   - Interloper_LE
+  - Mech_Depot_LE
 val_map_names:
   - Abyssal_Reef_LE
   - Acolyte_LE
   - Ascension_to_Aiur_LE
-  - Catallena_LE_(Void)
   - Interloper_LE
+  - Mech_Depot_LE
 test_map_names: null

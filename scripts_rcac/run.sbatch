@@ -10,9 +10,10 @@
 #SBATCH --output=logs/slurm/%j.out
 #SBATCH --error=logs/slurm/%j.err
 
-# Usage: sbatch scripts_rcac/run.sbatch train_smart.sh
+# Usage: sbatch scripts_rcac/run.sbatch train_sc.sh [variant] [dataset]
 
-SCRIPT=${1:?Usage: sbatch scripts_rcac/run.sbatch <script_name.sh>}
+SCRIPT=${1:?Usage: sbatch scripts_rcac/run.sbatch <script.sh> [args...]}
+shift
 
 mkdir -p logs/slurm
 
@@ -23,4 +24,4 @@ export MASTER_ADDR=$(hostname)
 export MASTER_PORT=29500
 
 cd /scratch/gautschi/chen5262/PythonProject/catk_starcraft
-bash scripts_rcac/$SCRIPT
+bash scripts_rcac/$SCRIPT "$@"
