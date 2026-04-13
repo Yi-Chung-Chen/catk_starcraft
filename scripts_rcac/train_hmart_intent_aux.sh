@@ -25,6 +25,7 @@ if [ "$NGPUS" -gt 1 ]; then
     data.train_batch_size=16 \
     data.val_batch_size=16 \
     data.test_batch_size=16 \
+    trainer.max_epochs=10 \
     model.model_config.use_aux_loss=true \
     model.model_config.decoder.use_action_target_input=true \
     model.model_config.decoder.num_concepts=16
@@ -35,6 +36,7 @@ else
     data.train_batch_size=16 \
     data.val_batch_size=16 \
     data.test_batch_size=16 \
+    trainer.max_epochs=10 \
     model.model_config.use_aux_loss=true \
     model.model_config.decoder.use_action_target_input=true \
     model.model_config.decoder.num_concepts=16

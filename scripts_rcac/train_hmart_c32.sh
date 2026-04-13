@@ -25,6 +25,7 @@ if [ "$NGPUS" -gt 1 ]; then
     data.train_batch_size=8 \
     data.val_batch_size=8 \
     data.test_batch_size=8 \
+    trainer.max_epochs=10 \
     model.model_config.use_aux_loss=false \
     model.model_config.decoder.num_concepts=32
 else
@@ -34,6 +35,7 @@ else
     data.train_batch_size=8 \
     data.val_batch_size=8 \
     data.test_batch_size=8 \
+    trainer.max_epochs=10 \
     model.model_config.use_aux_loss=false \
     model.model_config.decoder.num_concepts=32
 fi
