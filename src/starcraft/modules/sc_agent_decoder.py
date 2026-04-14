@@ -42,6 +42,9 @@ class SCAgentDecoder(nn.Module):
         use_action_target_input: bool = False,
         closed_loop_oracle_intent_input: bool = False,
         num_action_classes: int = 11,
+        use_opponent_future: bool = False,
+        opponent_future_horizon: int = 6,
+        opponent_future_drop_prob: float = 0.05,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -54,6 +57,9 @@ class SCAgentDecoder(nn.Module):
         self.num_concepts = num_concepts
         self.shift = 8
         self.hist_drop_prob = hist_drop_prob
+        self.use_opponent_future = use_opponent_future
+        self.opponent_future_horizon = opponent_future_horizon
+        self.opponent_future_drop_prob = opponent_future_drop_prob
 
         input_dim_x_a = 2
         input_dim_r_t = 4
@@ -413,11 +419,17 @@ class SCAgentDecoder(nn.Module):
         return edge_index_pl2a, r_pl2a
 
     def build_cross_player_edge(self, pos_a, head_a, head_vector_a, batch_s, mask,
-                                owner, visible_status):
+                                owner, visible_status,
+                                gt_pos_all=None, gt_head_all=None,
+                                gt_valid_all=None):
         """Build cross-player edges with fog-of-war. Source=frozen, target=player units.
 
         Edges: P1↔P2, P1↔Neutral(src), P2↔Neutral(src). Neutrals are source-only.
         Uses step-major layout matching a2a edges.
+
+        When use_opponent_future is enabled, extends with dt>0 edges from future
+        positions. In training, future positions come from pos_s (all 18 steps).
+        In inference, gt_pos_all/gt_head_all provide GT future positions.
         """
         n_agent, n_step = pos_a.shape[:2]
         mask_s = mask.transpose(0, 1).reshape(-1)
@@ -454,21 +466,140 @@ class SCAgentDecoder(nn.Module):
 
         edge_index_cross = edge_index[:, cross & vis_ok]
 
-        # Edge features: [distance, bearing, heading_diff]
+        # Decide whether to include future edges
+        include_future = self.use_opponent_future and (
+            not self.training or torch.rand(1).item() >= self.opponent_future_drop_prob
+        )
+
+        if include_future:
+            # Build dt>0 edges by shifting source to future steps
+            # In inference with gt_pos_all: use GT positions for edge features,
+            # and map source indices into the stacked source tensor layout
+            # [dt=0: 0..n_agent-1, dt=1: n_agent..2*n_agent-1, ...]
+            if gt_pos_all is not None:
+                # Inference path: gt_pos_all/gt_head_all cover [hist_window_start .. +hist_step+H)
+                # Local index 0..hist_step-1 = history, hist_step.. = future steps.
+                # The stacked source tensor follows the same layout, so source index
+                # for dt=d at local step s is (s + d) * n_agent + agent.
+                n_gt_steps = gt_pos_all.shape[1]
+                src_step_local = edge_index_cross[0] // n_agent
+                src_agent = edge_index_cross[0] % n_agent
+
+                # Pre-flatten GT positions/headings/validity to step-major
+                gt_pos_s = gt_pos_all.transpose(0, 1).flatten(0, 1)  # [n_gt_steps*n_agent, 2]
+                gt_head_s = gt_head_all.transpose(0, 1).reshape(-1)  # [n_gt_steps*n_agent]
+                if gt_valid_all is not None:
+                    gt_valid_s = gt_valid_all.transpose(0, 1).reshape(-1)  # [n_gt_steps*n_agent]
+
+                future_edges = []
+                future_feats = []
+                for d in range(1, self.opponent_future_horizon + 1):
+                    shifted_step = src_step_local + d
+                    in_bounds = shifted_step < n_gt_steps
+                    future_src_flat = shifted_step * n_agent + src_agent
+                    valid = in_bounds
+                    # Filter out dead/padded units at future step
+                    if gt_valid_all is not None:
+                        valid = valid & gt_valid_s[future_src_flat.clamp(max=n_gt_steps * n_agent - 1)]
+
+                    if valid.any():
+                        new_edge = torch.stack([future_src_flat[valid], edge_index_cross[1][valid]])
+                        future_edges.append(new_edge)
+
+                        # Edge features: source at GT future position, target at current position
+                        src_gt_idx = future_src_flat[valid]
+                        tgt_idx = edge_index_cross[1][valid]
+                        rel_pos_f = gt_pos_s[src_gt_idx] - pos_s[tgt_idx]
+                        rel_head_f = wrap_angle(gt_head_s[src_gt_idx] - head_s[tgt_idx])
+                        feat_f = torch.stack([
+                            torch.norm(rel_pos_f[:, :2], p=2, dim=-1),
+                            angle_between_2d_vectors(ctr_vector=head_vector_s[tgt_idx], nbr_vector=rel_pos_f[:, :2]),
+                            rel_head_f,
+                            torch.full((rel_head_f.shape[0],), d, device=pos_s.device, dtype=rel_head_f.dtype),
+                        ], dim=-1)
+                        future_feats.append(feat_f)
+
+                # Combine dt=0 and future edges with 4-dim features via r_t_emb
+                rel_pos_dt0 = pos_s[edge_index_cross[0]] - pos_s[edge_index_cross[1]]
+                rel_head_dt0 = wrap_angle(head_s[edge_index_cross[0]] - head_s[edge_index_cross[1]])
+                feat_dt0 = torch.stack([
+                    torch.norm(rel_pos_dt0[:, :2], p=2, dim=-1),
+                    angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_cross[1]], nbr_vector=rel_pos_dt0[:, :2]),
+                    rel_head_dt0,
+                    torch.zeros(edge_index_cross.shape[1], device=pos_s.device),
+                ], dim=-1)
+
+                if future_edges:
+                    edge_index_future = torch.cat(future_edges, dim=1)
+                    r_cross_raw = torch.cat([feat_dt0] + future_feats, dim=0)
+                    edge_index_cross = torch.cat([edge_index_cross, edge_index_future], dim=1)
+                else:
+                    r_cross_raw = feat_dt0
+
+                r_cross = self.r_t_emb(continuous_inputs=r_cross_raw, categorical_embs=None)
+                return edge_index_cross, r_cross
+            else:
+                # Training path: pos_s covers all 18 steps, shift source indices directly
+                src_step = edge_index_cross[0] // n_agent
+                src_agent = edge_index_cross[0] % n_agent
+                n_total = n_step * n_agent
+
+                future_edges = []
+                for d in range(1, self.opponent_future_horizon + 1):
+                    future_step = src_step + d
+                    future_src = future_step * n_agent + src_agent
+                    in_bounds = future_step < n_step
+                    valid = in_bounds & mask_s[future_src.clamp(max=n_total - 1)] & in_bounds
+                    if valid.any():
+                        future_edges.append(torch.stack([future_src[valid], edge_index_cross[1][valid]]))
+
+                if future_edges:
+                    edge_index_future = torch.cat(future_edges, dim=1)
+                    edge_index_all = torch.cat([edge_index_cross, edge_index_future], dim=1)
+                else:
+                    edge_index_all = edge_index_cross
+
+                # All edges get 4-dim features with dt, embedded via r_t_emb
+                rel_pos = pos_s[edge_index_all[0]] - pos_s[edge_index_all[1]]
+                rel_head = wrap_angle(head_s[edge_index_all[0]] - head_s[edge_index_all[1]])
+
+                dt = torch.zeros(edge_index_all.shape[1], device=pos_s.device)
+                offset = edge_index_cross.shape[1]
+                for d in range(1, self.opponent_future_horizon + 1):
+                    if d - 1 < len(future_edges):
+                        n_edges_d = future_edges[d - 1].shape[1]
+                        dt[offset:offset + n_edges_d] = d
+                        offset += n_edges_d
+
+                r_cross = torch.stack([
+                    torch.norm(rel_pos[:, :2], p=2, dim=-1),
+                    angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_all[1]], nbr_vector=rel_pos[:, :2]),
+                    rel_head,
+                    dt,
+                ], dim=-1)
+                r_cross = self.r_t_emb(continuous_inputs=r_cross, categorical_embs=None)
+                return edge_index_all, r_cross
+
+        # dt=0 only
         rel_pos = pos_s[edge_index_cross[0]] - pos_s[edge_index_cross[1]]
         rel_head = wrap_angle(head_s[edge_index_cross[0]] - head_s[edge_index_cross[1]])
-        r_cross = torch.stack(
-            [
+        if self.use_opponent_future:
+            # use r_t_emb with dt=0 for consistent embedding space with future-enabled runs
+            r_cross = torch.stack([
                 torch.norm(rel_pos[:, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_s[edge_index_cross[1]],
-                    nbr_vector=rel_pos[:, :2],
-                ),
+                angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_cross[1]], nbr_vector=rel_pos[:, :2]),
                 rel_head,
-            ],
-            dim=-1,
-        )
-        r_cross = self.r_a2a_emb(continuous_inputs=r_cross, categorical_embs=None)
+                torch.zeros(edge_index_cross.shape[1], device=pos_s.device),
+            ], dim=-1)
+            r_cross = self.r_t_emb(continuous_inputs=r_cross, categorical_embs=None)
+        else:
+            # baseline: use r_a2a_emb (3 features, no dt)
+            r_cross = torch.stack([
+                torch.norm(rel_pos[:, :2], p=2, dim=-1),
+                angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_cross[1]], nbr_vector=rel_pos[:, :2]),
+                rel_head,
+            ], dim=-1)
+            r_cross = self.r_a2a_emb(continuous_inputs=r_cross, categorical_embs=None)
         return edge_index_cross, r_cross
 
     def forward(
@@ -647,6 +778,24 @@ class SCAgentDecoder(nn.Module):
             )
         )
 
+        # Pre-compute GT frozen features for opponent future (all 18 steps)
+        if self.use_opponent_future:
+            with torch.no_grad():
+                feat_a_gt_all = self.agent_token_embedding(
+                    agent_token_index=tokenized_agent["gt_idx"],
+                    trajectory_token=tokenized_agent["trajectory_token"],
+                    pos_a=tokenized_agent["gt_pos"],
+                    head_vector_a=torch.stack([
+                        tokenized_agent["gt_heading"].cos(),
+                        tokenized_agent["gt_heading"].sin(),
+                    ], dim=-1),
+                    agent_type=tokenized_agent["type"],
+                    unit_state=tokenized_agent["unit_state"],
+                    owner_idx=tokenized_agent["owner_idx"],
+                    unit_props=tokenized_agent["unit_props"],
+                )  # [n_agent, 18, hidden_dim]
+            gt_head_all = tokenized_agent["gt_heading"]  # [n_agent, 18]
+
         # Token data for rollout
         token_traj_all = tokenized_agent["token_traj_all"]  # [n_token, 9, 4, 2]
         token_traj = tokenized_agent["token_traj"]  # [n_token, 4, 2]
@@ -734,6 +883,22 @@ class SCAgentDecoder(nn.Module):
             # Cross-player edges and frozen source features (same hist_step window)
             vis_idx_end = min(n_step, 18)
             vis_idx_start = vis_idx_end - hist_step
+
+            # For opponent future in inference: pass GT positions for future edge features
+            # gt_pos_slice covers [hist_window_start .. hist_window_start + hist_step + H)
+            # so that indices 0..hist_step-1 = history, hist_step..hist_step+H-1 = future
+            if self.use_opponent_future:
+                H = self.opponent_future_horizon
+                gt_start = min(n_step - hist_step, 17)  # start of history window in GT
+                end_step = min(gt_start + hist_step + H, 18)
+                gt_pos_slice = tokenized_agent["gt_pos"][:, gt_start:end_step]
+                gt_head_slice = gt_head_all[:, gt_start:end_step]
+                gt_valid_slice = tokenized_agent["valid_mask"][:, gt_start:end_step]
+            else:
+                gt_pos_slice = None
+                gt_head_slice = None
+                gt_valid_slice = None
+
             edge_index_cross, r_cross = self.build_cross_player_edge(
                 pos_a=pos_a[:, -hist_step:],
                 head_a=head_a[:, -hist_step:],
@@ -742,9 +907,26 @@ class SCAgentDecoder(nn.Module):
                 mask=pred_valid[:, n_step - hist_step:n_step] if t == 0 else inference_mask[:, -hist_step:],
                 owner=tokenized_agent["owner"],
                 visible_status=tokenized_agent["visible_status"][:, vis_idx_start:vis_idx_end],
+                gt_pos_all=gt_pos_slice,
+                gt_head_all=gt_head_slice,
+                gt_valid_all=gt_valid_slice,
             )
-            # Frozen source: initial embeddings from feat_a (never overwritten by attention)
-            feat_cross_src = feat_a[:, -hist_step:].transpose(0, 1).flatten(0, 1)
+
+            # Frozen source features for cross-player attention
+            if self.use_opponent_future:
+                # dt=0 portion: use feat_a (predicted initial embeddings, not oracle GT)
+                feat_dt0_src = feat_a[:, -hist_step:].transpose(0, 1).flatten(0, 1)
+                # dt>0 portion: use GT frozen features for future steps
+                future_start = gt_start + hist_step
+                if future_start < end_step:
+                    feat_future_src = feat_a_gt_all[:, future_start:end_step, :].transpose(0, 1).flatten(0, 1)
+                    feat_cross_src = torch.cat([feat_dt0_src, feat_future_src], dim=0)
+                else:
+                    feat_cross_src = feat_dt0_src
+                # [hist_step*n_agent + n_future*n_agent, d]
+            else:
+                # dt=0 only: use initial embeddings from feat_a
+                feat_cross_src = feat_a[:, -hist_step:].transpose(0, 1).flatten(0, 1)
 
             # Build concept attention edges for this rollout step
             if self.num_concepts > 0:
