@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: bash scripts_rcac/train_sc.sh [variant] [dataset]
 #   variant: smart (default), hmart, hmart_aux, hmart_c8, hmart_c32,
-#            hmart_intent, hmart_intent_aux
+#            hmart_intent, hmart_intent_aux, hmart_future
 #   dataset: adv (default), unbias
 
 export LOGLEVEL=INFO
@@ -46,6 +46,9 @@ case "$VARIANT" in
     ;;
   hmart_intent_aux)
     MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=16 model.model_config.decoder.use_action_target_input=true"
+    ;;
+  hmart_future)
+    MODEL_OVERRIDES="model.model_config.use_aux_loss=false model.model_config.decoder.num_concepts=16 model.model_config.decoder.use_opponent_future=true"
     ;;
   *)
     echo "Unknown variant: $VARIANT"; exit 1
