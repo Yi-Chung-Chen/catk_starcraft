@@ -12,7 +12,7 @@ from src.smart.metrics import TokenCls, minADE
 from src.starcraft.metrics.sc_action_target_loss import SCActionTargetLoss
 from src.starcraft.metrics.sc_cross_entropy import SCCrossEntropy
 from src.starcraft.modules.sc_decoder import SCDecoder
-from src.starcraft.tokens.sc_token_processor import SCTokenProcessor
+from src.starcraft.tokens.sc_token_processor import SCTokenProcessor, filter_agents_for_perspective
 from src.starcraft.utils.vis_starcraft import extract_scenario_data, save_scenario_gif
 from src.smart.utils.finetune import set_model_for_finetuning
 
@@ -43,6 +43,8 @@ class SCSMART(LightningModule):
         if self.use_aux_loss:
             self.action_target_loss = SCActionTargetLoss(**model_config.action_target_loss)
         self.minADE = minADE()
+        self.minADE_observer = minADE()
+        self.minADE_opponent = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
@@ -60,24 +62,34 @@ class SCSMART(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        train_mask = data["agent"]["train_mask"]
+
+        # Randomly choose one observer perspective per step
+        observer_player = 1 if torch.rand(1).item() < 0.5 else 2
+        filtered_agent, obs_mask, opp_mask, _ = filter_agents_for_perspective(
+            tokenized_agent, train_mask, observer_player,
+        )
 
         if self.training_rollout_sampling.num_k <= 0:
-            pred = self.encoder(tokenized_map, tokenized_agent)
+            pred = self.encoder(tokenized_map, filtered_agent)
         else:
             pred = self.encoder.inference(
-                tokenized_map, tokenized_agent,
+                tokenized_map, filtered_agent,
                 sampling_scheme=self.training_rollout_sampling,
             )
 
+        # Trajectory loss: observer + opponent units
+        combined_mask = obs_mask | opp_mask
         loss_motion = self.training_loss(
             **pred,
-            token_agent_shape=tokenized_agent["token_agent_shape"],
-            token_traj=tokenized_agent["token_traj"],  # [n_token, 4, 2]
-            train_mask=data["agent"]["train_mask"],
+            token_agent_shape=filtered_agent["token_agent_shape"],
+            token_traj=filtered_agent["token_traj"],
+            train_mask=combined_mask,
         )
+        # Aux loss: observer only (opponent has no intent)
         if self.use_aux_loss:
             loss_aux = self.action_target_loss(
-                **pred, train_mask=data["agent"]["train_mask"],
+                **pred, train_mask=obs_mask,
             )
             loss = loss_motion + loss_aux
             for k, v in self.action_target_loss.batch_components().items():
@@ -90,91 +102,67 @@ class SCSMART(LightningModule):
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
-
         train_mask = data["agent"]["train_mask"]
 
-        if self.val_open_loop:
-            pred = self.encoder(tokenized_map, tokenized_agent)
-            loss = self.training_loss(
-                **pred,
-                token_agent_shape=tokenized_agent["token_agent_shape"],
-                token_traj=tokenized_agent["token_traj"],
-                train_mask=train_mask,
+        # Run both perspectives for complete metrics
+        for observer_player in [1, 2]:
+            filtered_agent, obs_mask, opp_mask, keep_mask = filter_agents_for_perspective(
+                tokenized_agent, train_mask, observer_player,
             )
-            if self.use_aux_loss:
-                self.action_target_loss(**pred, train_mask=train_mask)
-                for k, v in self.action_target_loss.batch_components().items():
-                    self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
+            combined_mask = obs_mask | opp_mask
 
-            self.TokenCls.update(
-                pred=pred["next_token_logits"],
-                pred_valid=pred["next_token_valid"] & train_mask.unsqueeze(1),
-                target=tokenized_agent["gt_idx"][:, 2:],
-                target_valid=tokenized_agent["valid_mask"][:, 2:] & train_mask.unsqueeze(1),
-            )
-            self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
+            if self.val_open_loop:
+                pred = self.encoder(tokenized_map, filtered_agent)
+                loss = self.training_loss(
+                    **pred,
+                    token_agent_shape=filtered_agent["token_agent_shape"],
+                    token_traj=filtered_agent["token_traj"],
+                    train_mask=combined_mask,
+                )
+                if self.use_aux_loss:
+                    self.action_target_loss(**pred, train_mask=obs_mask)
+                    for k, v in self.action_target_loss.batch_components().items():
+                        self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
+
+                self.TokenCls.update(
+                    pred=pred["next_token_logits"],
+                    pred_valid=pred["next_token_valid"] & combined_mask.unsqueeze(1),
+                    target=filtered_agent["gt_idx"][:, 2:],
+                    target_valid=filtered_agent["valid_mask"][:, 2:] & combined_mask.unsqueeze(1),
+                )
+                self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
+
+            if self.val_closed_loop:
+                pred_traj_list = []
+                for _ in range(self.n_rollout_closed_val):
+                    pred = self.encoder.inference(
+                        tokenized_map, filtered_agent, self.validation_rollout_sampling
+                    )
+                    pred_traj_list.append(pred["pred_traj_native"])
+
+                pred_traj = torch.stack(pred_traj_list, dim=1)  # [n_filtered, n_rollout, n_step, 2]
+
+                # Align targets to filtered agent indices using keep_mask
+                target = data["agent"]["position"][keep_mask, self.num_historical_steps:, :pred_traj.shape[-1]]
+                alive_at_current = data["agent"]["valid_mask"][keep_mask, self.num_historical_steps - 1]
+                target_valid = (
+                    data["agent"]["valid_mask"][keep_mask, self.num_historical_steps:]
+                    & alive_at_current.unsqueeze(1)
+                )
+
+                # Observer ADE
+                obs_valid = target_valid & obs_mask.unsqueeze(1)
+                self.minADE_observer.update(pred=pred_traj, target=target, target_valid=obs_valid)
+
+                # Opponent ADE
+                opp_valid = target_valid & opp_mask.unsqueeze(1)
+                if opp_valid.any():
+                    self.minADE_opponent.update(pred=pred_traj, target=target, target_valid=opp_valid)
 
         if self.val_closed_loop:
-            pred_traj = []
-            aux_target_list = []
-            _AUX_KEYS = ("target_pos_pred", "has_target_pos_logits",
-                         "gt_rel_target_pos", "gt_has_target_pos")
-            for _ in range(self.n_rollout_closed_val):
-                pred = self.encoder.inference(
-                    tokenized_map, tokenized_agent, self.validation_rollout_sampling
-                )
-                pred_traj.append(pred["pred_traj_native"])
-                if self.use_aux_loss and "target_pos_pred" in pred:
-                    aux_target_list.append({k: pred[k] for k in _AUX_KEYS})
-
-            pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
-
-            # Agents not alive at the current frame have no valid initial position,
-            # so their predictions are garbage (centered at origin).  Exclude them
-            # from metrics and visualization, mirroring the train_mask filter.
-            alive_at_current = data["agent"]["valid_mask"][
-                :, self.num_historical_steps - 1
-            ]
-            target_valid = (
-                data["agent"]["valid_mask"][:, self.num_historical_steps :]
-                & alive_at_current.unsqueeze(1)
-                & train_mask.unsqueeze(1)
-            )
-
-            self.minADE.update(
-                pred=pred_traj,
-                target=data["agent"]["position"][
-                    :, self.num_historical_steps :, :pred_traj.shape[-1]
-                ],
-                target_valid=target_valid,
-            )
-            self.log("val_closed/ADE", self.minADE, on_epoch=True, sync_dist=True, batch_size=1)
-
-            if self.global_rank == 0 and batch_idx < self.n_vis_batch:
-                n_scenarios = min(self.n_vis_scenario, data.num_graphs)
-                n_rollouts_vis = min(self.n_vis_rollout, pred_traj.shape[1])
-                for i_sc in range(n_scenarios):
-                    for i_roll in range(n_rollouts_vis):
-                        aux_data = aux_target_list[i_roll] if aux_target_list else None
-                        sc_data = extract_scenario_data(
-                            data, pred_traj, i_sc, i_roll,
-                            num_historical_steps=self.num_historical_steps,
-                            aux_target_data=aux_data,
-                            map_data_dir=self.token_processor.map_data_dir,
-                        )
-                        save_dir = (
-                            self.gif_dir
-                            / f"batch_{batch_idx:02d}"
-                            / f"scenario_{i_sc:02d}"
-                        )
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        gif_path = save_dir / f"rollout_{i_roll:02d}.gif"
-                        save_scenario_gif(
-                            **sc_data,
-                            save_path=str(gif_path),
-                            num_historical_steps=self.num_historical_steps,
-                        )
+            self.log("val_closed/ADE_observer", self.minADE_observer, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_closed/ADE_opponent", self.minADE_opponent, on_epoch=True, sync_dist=True, batch_size=1)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)

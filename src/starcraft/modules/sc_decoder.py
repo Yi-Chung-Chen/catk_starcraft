@@ -33,9 +33,6 @@ class SCDecoder(nn.Module):
         use_action_target_input: bool = False,
         closed_loop_oracle_intent_input: bool = False,
         num_action_classes: int = 11,
-        use_opponent_future: bool = False,
-        opponent_future_horizon: int = 6,
-        opponent_future_drop_prob: float = 0.05,
     ) -> None:
         super().__init__()
         self.map_encoder = SCMapEncoder(
@@ -64,9 +61,6 @@ class SCDecoder(nn.Module):
             use_action_target_input=use_action_target_input,
             closed_loop_oracle_intent_input=closed_loop_oracle_intent_input,
             num_action_classes=num_action_classes,
-            use_opponent_future=use_opponent_future,
-            opponent_future_horizon=opponent_future_horizon,
-            opponent_future_drop_prob=opponent_future_drop_prob,
         )
 
     def forward(

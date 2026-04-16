@@ -42,9 +42,6 @@ model_config:
     use_action_target_input: false
     closed_loop_oracle_intent_input: false
     num_action_classes: 11
-    use_opponent_future: false
-    opponent_future_horizon: 6
-    opponent_future_drop_prob: 0.05
   use_aux_loss: true
   action_target_loss:
     has_action_weight: 1.0

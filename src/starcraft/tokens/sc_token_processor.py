@@ -43,6 +43,137 @@ def _vectorized_coarse_action(ability_ids: Tensor) -> Tensor:
 _PATCH_STRIDE = 8   # CNN stride-8 downsampling (3 layers) → 25x25 grid
 _GRID_SIZE = _PADDED_SIZE // _PATCH_STRIDE  # 25
 
+# --- Perspective-based agent filtering ---
+# Keys with agent dimension (dim-0 = n_agent) that must be filtered by keep_mask.
+_AGENT_DIM0_KEYS = frozenset({
+    "type", "owner", "owner_idx", "ego_mask", "unit_state", "batch",
+    "token_agent_shape", "unit_props",
+    "valid_mask", "gt_idx", "sampled_idx", "sampled_pos", "sampled_heading",
+    "gt_pos", "gt_heading", "gt_pos_raw", "gt_head_raw", "gt_valid_raw",
+    "visible_status", "coarse_action", "has_action", "has_target_pos",
+    "rel_target_pos",
+    "gt_z_raw",  # only present during eval
+    "is_observer",  # only present after filter_agents_for_perspective
+})
+# Keys shared across all agents (vocab tensors, scalars) — passed through unfiltered.
+_SHARED_KEYS = frozenset({
+    "num_graphs", "token_traj_all", "token_traj", "trajectory_token",
+    "player_start_loc",
+    "observer_start_loc",  # only present after filter_agents_for_perspective
+})
+
+
+def filter_agents_for_perspective(
+    tokenized_agent: Dict[str, Tensor],
+    train_mask: Tensor,
+    observer_player: int,
+    min_future_visible: int = 8,
+) -> Tuple[Dict[str, Tensor], Tensor, Tensor, Tensor]:
+    """Filter agents to observer's perspective and build per-role train masks.
+
+    Drops non-visible opponent units entirely (they have no edges and no loss
+    after removing opponent-opponent a2a).  Remaps ``owner_idx`` to
+    0=observer, 1=opponent, 2=neutral.  Zeros out intent fields for
+    non-observer units.
+
+    Returns:
+        filtered_agent: tokenized_agent dict with non-visible opponents removed.
+        observer_train_mask: [n_filtered] bool — observer units eligible for
+            trajectory + intent loss.
+        opponent_train_mask: [n_filtered] bool — visible opponent units eligible
+            for trajectory-only loss.
+        keep_mask: [n_agent_original] bool — maps filtered indices back to
+            original agent ordering (needed for validation target alignment).
+    """
+    owner = tokenized_agent["owner"]  # [n_agent], values {1, 2, 16}
+
+    # --- Visibility at current frame (token step 1 = raw frame 16) ---
+    vis_at_current = tokenized_agent["visible_status"][:, 1]
+    if observer_player == 1:
+        observer_sees = (vis_at_current // 3) == 2
+    else:
+        observer_sees = (vis_at_current % 3) == 2
+
+    is_own = owner == observer_player
+    is_neutral = owner == 16
+    is_opponent = ~is_own & ~is_neutral
+    keep_mask = is_own | is_neutral | (is_opponent & observer_sees)
+
+    # --- Filter all per-agent tensors ---
+    out: Dict[str, Tensor] = {}
+    for k, v in tokenized_agent.items():
+        if k in _SHARED_KEYS:
+            out[k] = v
+        elif k in _AGENT_DIM0_KEYS:
+            out[k] = v[keep_mask]
+        else:
+            raise ValueError(
+                f"Unknown tokenized_agent key '{k}' — "
+                "add to _AGENT_DIM0_KEYS or _SHARED_KEYS in sc_token_processor.py"
+            )
+
+    # --- Remap owner_idx: 0=observer, 1=opponent, 2=neutral ---
+    out["owner_idx"] = _remap_owner_perspective(out["owner"], observer_player)
+
+    # --- is_observer flag for intent gating ---
+    is_observer = out["owner"] == observer_player
+
+    # --- Observer start location for concept attention ---
+    obs_start_idx = 0 if observer_player == 1 else 1
+    out["observer_start_loc"] = out["player_start_loc"][:, obs_start_idx]  # [B, 2]
+    out["is_observer"] = is_observer
+
+    # --- Zero out intent for non-observer (opponent + neutral) units ---
+    non_obs = ~is_observer
+    if non_obs.any():
+        out["coarse_action"] = out["coarse_action"].clone()
+        out["has_action"] = out["has_action"].clone()
+        out["rel_target_pos"] = out["rel_target_pos"].clone()
+        out["has_target_pos"] = out["has_target_pos"].clone()
+        out["coarse_action"][non_obs] = 0
+        out["has_action"][non_obs] = False
+        out["rel_target_pos"][non_obs] = 0.0
+        out["has_target_pos"][non_obs] = False
+
+    # --- Build per-role train masks ---
+    filtered_train_mask = train_mask[keep_mask]
+    is_neutral_filtered = out["owner"] == 16
+    observer_train_mask = filtered_train_mask & is_observer
+
+    # Opponent train mask: additionally require future visibility >= threshold
+    vis_future = tokenized_agent["visible_status"][:, 2:]  # [n_agent, 16] future steps
+    if observer_player == 1:
+        future_vis_decoded = (vis_future // 3) == 2
+    else:
+        future_vis_decoded = (vis_future % 3) == 2
+    future_visible_count = future_vis_decoded[keep_mask].sum(-1)  # [n_filtered]
+    opponent_train_mask = (
+        filtered_train_mask
+        & ~is_observer
+        & ~is_neutral_filtered
+        & (future_visible_count >= min_future_visible)
+    )
+
+    # --- Debug assertions ---
+    assert out["batch"].max() < out["num_graphs"], "batch index out of range after filtering"
+    assert out["owner"].shape[0] == out["valid_mask"].shape[0], "agent count mismatch"
+    num_graphs = out["num_graphs"]
+    for g in range(num_graphs):
+        assert (out["batch"][is_observer] == g).any(), (
+            f"graph {g} lost all observer units after filtering"
+        )
+
+    return out, observer_train_mask, opponent_train_mask, keep_mask
+
+
+def _remap_owner_perspective(owner: Tensor, observer_player: int) -> Tensor:
+    """Remap raw owner to perspective-relative indices: 0=observer, 1=opponent, 2=neutral."""
+    idx = torch.full_like(owner, 2)  # default: neutral
+    idx[owner == observer_player] = 0  # observer
+    opponent_player = 2 if observer_player == 1 else 1
+    idx[owner == opponent_player] = 1  # opponent
+    return idx
+
 
 class SCTokenProcessor(torch.nn.Module):
 

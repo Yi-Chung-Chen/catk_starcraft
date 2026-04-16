@@ -47,9 +47,6 @@ case "$VARIANT" in
   hmart_intent_aux)
     MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=16 model.model_config.decoder.use_action_target_input=true"
     ;;
-  hmart_future)
-    MODEL_OVERRIDES="model.model_config.use_aux_loss=false model.model_config.decoder.num_concepts=16 model.model_config.decoder.use_opponent_future=true"
-    ;;
   *)
     echo "Unknown variant: $VARIANT"; exit 1
     ;;
