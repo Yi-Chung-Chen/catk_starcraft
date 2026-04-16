@@ -8,6 +8,7 @@ model_config:
   n_vis_batch: 0
   n_vis_scenario: 2
   n_vis_rollout: 1
+  vis_observer_player: both
   val_open_loop: true
   val_closed_loop: false
   token_processor:

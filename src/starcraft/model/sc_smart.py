@@ -54,6 +54,7 @@ class SCSMART(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
+        self.vis_observer_player = model_config.vis_observer_player
 
         self.gif_dir = (
             Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
@@ -135,11 +136,18 @@ class SCSMART(LightningModule):
 
             if self.val_closed_loop:
                 pred_traj_list = []
+                aux_target_list = []
+                _AUX_KEYS = (
+                    "target_pos_pred", "has_target_pos_logits",
+                    "gt_rel_target_pos", "gt_has_target_pos",
+                )
                 for _ in range(self.n_rollout_closed_val):
                     pred = self.encoder.inference(
                         tokenized_map, filtered_agent, self.validation_rollout_sampling
                     )
                     pred_traj_list.append(pred["pred_traj_native"])
+                    if self.use_aux_loss:
+                        aux_target_list.append({k: pred[k] for k in _AUX_KEYS})
 
                 pred_traj = torch.stack(pred_traj_list, dim=1)  # [n_filtered, n_rollout, n_step, 2]
 
@@ -159,6 +167,58 @@ class SCSMART(LightningModule):
                 opp_valid = target_valid & opp_mask.unsqueeze(1)
                 if opp_valid.any():
                     self.minADE_opponent.update(pred=pred_traj, target=target, target_valid=opp_valid)
+
+                vis_enabled_this_pass = (
+                    self.vis_observer_player == "both"
+                    or (self.vis_observer_player == "p1" and observer_player == 1)
+                    or (self.vis_observer_player == "p2" and observer_player == 2)
+                )
+                if (
+                    vis_enabled_this_pass
+                    and self.global_rank == 0
+                    and batch_idx < self.n_vis_batch
+                ):
+                    N_total = data["agent"]["position"].shape[0]
+                    full_pred_traj = torch.zeros(
+                        N_total, *pred_traj.shape[1:],
+                        dtype=pred_traj.dtype, device=pred_traj.device,
+                    )
+                    full_pred_traj[keep_mask] = pred_traj
+
+                    n_scenarios = min(self.n_vis_scenario, data.num_graphs)
+                    n_rollouts_vis = min(self.n_vis_rollout, full_pred_traj.shape[1])
+                    obs_tag = f"obs_p{observer_player}"
+                    for i_sc in range(n_scenarios):
+                        for i_roll in range(n_rollouts_vis):
+                            aux_data = None
+                            if aux_target_list:
+                                aux_data = {}
+                                for k, v in aux_target_list[i_roll].items():
+                                    full_v = torch.zeros(
+                                        N_total, *v.shape[1:],
+                                        dtype=v.dtype, device=v.device,
+                                    )
+                                    full_v[keep_mask] = v
+                                    aux_data[k] = full_v
+                            sc_data = extract_scenario_data(
+                                data, full_pred_traj, i_sc, i_roll,
+                                num_historical_steps=self.num_historical_steps,
+                                aux_target_data=aux_data,
+                                map_data_dir=self.token_processor.map_data_dir,
+                                pred_valid_mask=keep_mask,
+                            )
+                            save_dir = (
+                                self.gif_dir
+                                / f"batch_{batch_idx:02d}"
+                                / f"scenario_{i_sc:02d}"
+                                / obs_tag
+                            )
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            save_scenario_gif(
+                                **sc_data,
+                                save_path=str(save_dir / f"rollout_{i_roll:02d}.gif"),
+                                num_historical_steps=self.num_historical_steps,
+                            )
 
         if self.val_closed_loop:
             self.log("val_closed/ADE_observer", self.minADE_observer, on_epoch=True, sync_dist=True, batch_size=1)

@@ -17,7 +17,7 @@ FPS = 16  # native frame rate
 
 def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
                           num_historical_steps=17, aux_target_data=None,
-                          map_data_dir=None):
+                          map_data_dir=None, pred_valid_mask=None):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -39,8 +39,12 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
 
     # Agents alive at the current frame have valid model predictions.
     # Agents spawning later started from (0,0) and must be excluded.
+    # `pred_valid_mask` additionally excludes agents the model never ran on
+    # (e.g. opponents hidden by fog of war), whose predictions are zero-filled.
     current_frame = num_historical_steps - 1
     pred_agent_mask = valid[:, current_frame].cpu().numpy()
+    if pred_valid_mask is not None:
+        pred_agent_mask = pred_agent_mask & pred_valid_mask[mask].cpu().numpy()
 
     out = {
         "gt_positions": data["agent"]["position"][mask, :, :2].cpu().numpy(),
