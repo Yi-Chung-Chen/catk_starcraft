@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: bash scripts_rcac/train_sc.sh [variant] [dataset]
 #   variant: smart (default), hmart, hmart_aux, hmart_c8, hmart_c32,
-#            hmart_intent, hmart_intent_aux, hmart_future
+#            hmart_intent, hmart_intent_aux, smart_intent_aux
 #   dataset: adv (default), unbias
 
 export LOGLEVEL=INFO
@@ -47,6 +47,15 @@ case "$VARIANT" in
   hmart_intent_aux)
     MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=16 model.model_config.decoder.use_action_target_input=true"
     ;;
+  smart_intent_aux)
+    MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=0 model.model_config.decoder.use_action_target_input=true"
+    ;;
+  hmart_c4_intent_aux)
+    MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=4 model.model_config.decoder.use_action_target_input=true"
+    ;;
+  hmart_c8_intent_aux)
+    MODEL_OVERRIDES="model.model_config.use_aux_loss=true model.model_config.decoder.num_concepts=8 model.model_config.decoder.use_action_target_input=true"
+    ;;
   *)
     echo "Unknown variant: $VARIANT"; exit 1
     ;;
@@ -70,7 +79,7 @@ if [ "$NGPUS" -gt 1 ]; then
     data.train_batch_size=$BATCH_SIZE \
     data.val_batch_size=$BATCH_SIZE \
     data.test_batch_size=$BATCH_SIZE \
-    trainer.max_epochs=10 \
+    trainer.max_epochs=16 \
     $DATA_OVERRIDES \
     $MODEL_OVERRIDES
 else
@@ -80,7 +89,7 @@ else
     data.train_batch_size=$BATCH_SIZE \
     data.val_batch_size=$BATCH_SIZE \
     data.test_batch_size=$BATCH_SIZE \
-    trainer.max_epochs=10 \
+    trainer.max_epochs=16 \
     $DATA_OVERRIDES \
     $MODEL_OVERRIDES
 fi
