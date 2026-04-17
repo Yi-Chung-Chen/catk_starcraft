@@ -11,6 +11,7 @@ model_config:
   vis_observer_player: both
   val_open_loop: true
   val_closed_loop: false
+  closed_loop_rollout_modes: [own, opponent]   # subset of [own, opponent]
   token_processor:
     motion_dict_file: ${paths.sc_motion_dict}
     map_data_dir: ${paths.sc_map_data}

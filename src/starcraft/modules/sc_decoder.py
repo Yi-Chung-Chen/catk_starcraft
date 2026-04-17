@@ -74,6 +74,12 @@ class SCDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         sampling_scheme: DictConfig,
+        teacher_force_mask: Optional[Tensor] = None,
+        visibility_gate: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         map_feature = self.map_encoder(tokenized_map)
-        return self.agent_encoder.inference(tokenized_agent, map_feature, sampling_scheme)
+        return self.agent_encoder.inference(
+            tokenized_agent, map_feature, sampling_scheme,
+            teacher_force_mask=teacher_force_mask,
+            visibility_gate=visibility_gate,
+        )

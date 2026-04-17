@@ -550,7 +550,22 @@ class SCAgentDecoder(nn.Module):
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
         sampling_scheme: DictConfig,
+        teacher_force_mask: Optional[torch.Tensor] = None,
+        visibility_gate: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Closed-loop rollout.
+
+        Args:
+            teacher_force_mask: [n_agent] bool. When provided, marks agents
+                whose next token is overridden by GT at every rollout step
+                (so their pos/head follow ground truth). Default None disables
+                teacher forcing (pure rollout for all agents).
+            visibility_gate: [n_agent, 18] bool. When provided together with
+                teacher_force_mask, enforces per-step observer visibility on
+                teacher-forced agents: they are removed from attention at
+                steps where the gate is False. Rollout agents stay valid
+                according to their own GT liveness.
+        """
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_step_future_native = self.num_future_steps  # 128
         n_step_future_2hz = n_step_future_native // self.shift  # 16
@@ -595,6 +610,17 @@ class SCAgentDecoder(nn.Module):
             )
 
         pred_valid = tokenized_agent["valid_mask"].clone()
+
+        # Fog-of-war gating on historical validity for teacher-forced agents.
+        # Future steps are handled inside the rollout loop (they're overwritten
+        # at each iteration, so a pre-loop gate would be clobbered).
+        if visibility_gate is not None and teacher_force_mask is not None:
+            tf_col = teacher_force_mask.unsqueeze(1)  # [n_agent, 1]
+            pred_valid[:, :step_current_2hz] = (
+                pred_valid[:, :step_current_2hz]
+                & (~tf_col | visibility_gate[:, :step_current_2hz])
+            )
+
         next_token_logits_list = []
         next_token_action_list = []
         if self.use_aux_loss:
@@ -755,6 +781,22 @@ class SCAgentDecoder(nn.Module):
                 )
             )  # next_token_traj_all: [n_agent, 9, 4, 2] in local coords
 
+            # Teacher-force selected agents onto GT tokens. Downstream state
+            # (next_pos, next_head, pred_traj_native, agent_token_emb_next) is
+            # recomputed from next_token_idx / next_token_traj_all below, so
+            # these two overrides propagate the GT update everywhere needed.
+            if teacher_force_mask is not None:
+                gt_idx_next = tokenized_agent["gt_idx"][:, n_step]  # [n_agent]
+                gt_token_traj_all = token_traj_all[gt_idx_next]  # [n_agent, 9, 4, 2]
+                next_token_idx = torch.where(
+                    teacher_force_mask, gt_idx_next, next_token_idx
+                )
+                next_token_traj_all = torch.where(
+                    teacher_force_mask.view(-1, 1, 1, 1),
+                    gt_token_traj_all,
+                    next_token_traj_all,
+                )
+
             # next_token_action from local endpoint (before global transform)
             diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 2]  # front - back
             next_token_action_list.append(
@@ -791,7 +833,21 @@ class SCAgentDecoder(nn.Module):
             next_head = torch.arctan2(diff_xy_next[:, 1], diff_xy_next[:, 0])
 
             pred_idx[:, n_step] = next_token_idx
-            pred_valid[:, n_step] = pred_valid[:, t_now]
+            # Rollout agents propagate validity from t_now (once dead, stay
+            # dead). Teacher-forced agents take validity from GT ∧ visibility
+            # at this exact step, so their fog-of-war state turns on/off per
+            # the real visibility timeline instead of being locked to t_now.
+            rollout_next_valid = pred_valid[:, t_now]
+            if teacher_force_mask is not None and visibility_gate is not None:
+                tf_next_valid = (
+                    tokenized_agent["valid_mask"][:, n_step]
+                    & visibility_gate[:, n_step]
+                )
+                pred_valid[:, n_step] = torch.where(
+                    teacher_force_mask, tf_next_valid, rollout_next_valid
+                )
+            else:
+                pred_valid[:, n_step] = rollout_next_valid
 
             pos_a = torch.cat([pos_a, next_pos.unsqueeze(1)], dim=1)
             head_a = torch.cat([head_a, next_head.unsqueeze(1)], dim=1)

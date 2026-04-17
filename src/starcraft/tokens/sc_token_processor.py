@@ -68,22 +68,31 @@ def filter_agents_for_perspective(
     train_mask: Tensor,
     observer_player: int,
     min_future_visible: int = 8,
-) -> Tuple[Dict[str, Tensor], Tensor, Tensor, Tensor]:
+    include_all_opponents: bool = False,
+) -> Tuple[Dict[str, Tensor], Tensor, Tensor, Tensor, Tensor]:
     """Filter agents to observer's perspective and build per-role train masks.
 
-    Drops non-visible opponent units entirely (they have no edges and no loss
-    after removing opponent-opponent a2a).  Remaps ``owner_idx`` to
-    0=observer, 1=opponent, 2=neutral.  Zeros out intent fields for
-    non-observer units.
+    With default ``include_all_opponents=False`` (used for training and open-loop
+    validation), drops opponent units not visible at the current frame entirely.
+    With ``include_all_opponents=True`` (used for closed-loop teacher-forcing
+    modes), keeps every opponent in the roster so late-observed opponents can
+    serve as GT-teacher-forced context once the observer would spot them.
+
+    Remaps ``owner_idx`` to 0=observer, 1=opponent, 2=neutral.  Zeros out
+    intent fields for non-observer units.
 
     Returns:
-        filtered_agent: tokenized_agent dict with non-visible opponents removed.
+        filtered_agent: tokenized_agent dict with non-kept agents removed.
         observer_train_mask: [n_filtered] bool — observer units eligible for
             trajectory + intent loss.
         opponent_train_mask: [n_filtered] bool — visible opponent units eligible
             for trajectory-only loss.
         keep_mask: [n_agent_original] bool — maps filtered indices back to
             original agent ordering (needed for validation target alignment).
+        vis_to_obs: [n_filtered, 18] bool — per-step visibility of each kept
+            agent to the observer. Observer's own units and neutrals are
+            always True; opponents follow the raw ``visible_status`` decoding.
+            Intended for fog-of-war gating in teacher-force rollout modes.
     """
     owner = tokenized_agent["owner"]  # [n_agent], values {1, 2, 16}
 
@@ -97,7 +106,10 @@ def filter_agents_for_perspective(
     is_own = owner == observer_player
     is_neutral = owner == 16
     is_opponent = ~is_own & ~is_neutral
-    keep_mask = is_own | is_neutral | (is_opponent & observer_sees)
+    if include_all_opponents:
+        keep_mask = is_own | is_neutral | is_opponent
+    else:
+        keep_mask = is_own | is_neutral | (is_opponent & observer_sees)
 
     # --- Filter all per-agent tensors ---
     out: Dict[str, Tensor] = {}
@@ -154,6 +166,19 @@ def filter_agents_for_perspective(
         & (future_visible_count >= min_future_visible)
     )
 
+    # --- Per-step visibility to observer (for fog-of-war gating) ---
+    vs = out["visible_status"]  # [n_filtered, 18]
+    if observer_player == 1:
+        vis_to_obs = (vs // 3) == 2
+    else:
+        vis_to_obs = (vs % 3) == 2
+    # Observer's own units and neutrals are always visible to the observer.
+    vis_to_obs = (
+        vis_to_obs
+        | is_observer.unsqueeze(1)
+        | is_neutral_filtered.unsqueeze(1)
+    )
+
     # --- Debug assertions ---
     assert out["batch"].max() < out["num_graphs"], "batch index out of range after filtering"
     assert out["owner"].shape[0] == out["valid_mask"].shape[0], "agent count mismatch"
@@ -163,7 +188,7 @@ def filter_agents_for_perspective(
             f"graph {g} lost all observer units after filtering"
         )
 
-    return out, observer_train_mask, opponent_train_mask, keep_mask
+    return out, observer_train_mask, opponent_train_mask, keep_mask, vis_to_obs
 
 
 def _remap_owner_perspective(owner: Tensor, observer_player: int) -> Tensor:
