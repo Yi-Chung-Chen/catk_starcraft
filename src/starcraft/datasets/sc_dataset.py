@@ -17,6 +17,8 @@ from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
+from src.starcraft.utils.sc_replay_io import apply_ever_alive_filter  # noqa: F401
+
 CURRENT_FRAME_IDX = 16
 TOTAL_FRAMES = 145
 
@@ -106,13 +108,8 @@ class SCDataset(Dataset):
         fill_mask = has_tid & (np.abs(target_pos).sum(axis=-1) == 0)
         target_pos[fill_mask] = resolved_xy[fill_mask]
 
-        # Filter: keep units alive at any timestep
-        ever_alive = is_alive.any(axis=0)  # (N,)
-        keep_idx = np.where(ever_alive)[0]
-
-        if len(keep_idx) == 0:
-            # Edge case: no alive units — return minimal valid data
-            keep_idx = np.array([0])
+        # Filter: keep units alive at any timestep (shared with offline loader)
+        keep_idx = apply_ever_alive_filter(is_alive)
 
         # Slice to kept units
         is_alive = is_alive[:, keep_idx]  # (T, N')

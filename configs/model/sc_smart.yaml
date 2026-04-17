@@ -12,6 +12,13 @@ model_config:
   val_open_loop: true
   val_closed_loop: false
   closed_loop_rollout_modes: [own, opponent]   # subset of [own, opponent]
+  # --- Closed-loop rollout save (offline metric harness) ---
+  save_closed_rollouts: false
+  rollout_save_dir: null                          # null → ${hydra.runtime.output_dir}/rollouts
+  save_rollout_modes: [own, opponent]
+  save_rollout_observers: [1, 2]
+  rollout_save_precision: fp16                    # fp16 | fp32
+  rollout_dataset_version: ${data.dataset_root}   # interpolated; helper takes basename
   token_processor:
     motion_dict_file: ${paths.sc_motion_dict}
     map_data_dir: ${paths.sc_map_data}

@@ -1,11 +1,14 @@
 """StarCraft SMART model (LightningModule)."""
 
+import hashlib
+import logging
 import math
 from pathlib import Path
 
 import hydra
 import torch
 from lightning import LightningModule
+from omegaconf import OmegaConf
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import TokenCls, minADE
@@ -13,8 +16,11 @@ from src.starcraft.metrics.sc_action_target_loss import SCActionTargetLoss
 from src.starcraft.metrics.sc_cross_entropy import SCCrossEntropy
 from src.starcraft.modules.sc_decoder import SCDecoder
 from src.starcraft.tokens.sc_token_processor import SCTokenProcessor, filter_agents_for_perspective
+from src.starcraft.utils.sc_rollout_io import save_rollout_batch
 from src.starcraft.utils.vis_starcraft import extract_scenario_data, save_scenario_gif
 from src.smart.utils.finetune import set_model_for_finetuning
+
+log = logging.getLogger(__name__)
 
 
 class SCSMART(LightningModule):
@@ -57,10 +63,35 @@ class SCSMART(LightningModule):
         self.n_vis_rollout = model_config.n_vis_rollout
         self.vis_observer_player = model_config.vis_observer_player
 
-        self.gif_dir = (
-            Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
-            / "gifs"
+        hydra_output_dir = Path(
+            hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         )
+        self.gif_dir = hydra_output_dir / "gifs"
+
+        # Closed-loop rollout save (offline metric harness)
+        self.save_closed_rollouts = bool(
+            getattr(model_config, "save_closed_rollouts", False)
+        )
+        rollout_save_dir_cfg = getattr(model_config, "rollout_save_dir", None)
+        self.rollout_save_dir = (
+            Path(rollout_save_dir_cfg) if rollout_save_dir_cfg
+            else hydra_output_dir / "rollouts"
+        )
+        self.save_rollout_modes = list(
+            getattr(model_config, "save_rollout_modes", ["own", "opponent"])
+        )
+        self.save_rollout_observers = [
+            int(o) for o in getattr(model_config, "save_rollout_observers", [1, 2])
+        ]
+        self.rollout_save_precision = str(
+            getattr(model_config, "rollout_save_precision", "fp16")
+        )
+        rdv = getattr(model_config, "rollout_dataset_version", None)
+        self.dataset_version = Path(rdv).name if rdv else "unknown"
+        self.model_config_hash = hashlib.sha256(
+            OmegaConf.to_yaml(model_config, resolve=True).encode()
+        ).hexdigest()[:16]
+        self.rollout_stage = "val"  # set in setup()
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -113,6 +144,12 @@ class SCSMART(LightningModule):
         return loss
 
     def validation_step(self, data, batch_idx):
+        return self._shared_eval_step(data, batch_idx, stage="val")
+
+    def test_step(self, data, batch_idx):
+        return self._shared_eval_step(data, batch_idx, stage="test")
+
+    def _shared_eval_step(self, data, batch_idx, stage: str):
         tokenized_map, tokenized_agent = self.token_processor(data)
         train_mask = data["agent"]["train_mask"]
 
@@ -141,7 +178,7 @@ class SCSMART(LightningModule):
                 if self.use_aux_loss:
                     self.action_target_loss(**pred, train_mask=obs_mask)
                     for k, v in self.action_target_loss.batch_components().items():
-                        self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
+                        self.log(f"{stage}_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
 
                 # pred_valid uses source-step validity (the step the
                 # prediction is made from). target_valid uses next-step
@@ -160,8 +197,8 @@ class SCSMART(LightningModule):
                     target=filtered_agent["gt_idx"][:, 2:],
                     target_valid=target_valid,
                 )
-                self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log(f"{stage}_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log(f"{stage}_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
 
             if self.val_closed_loop:
                 self._run_closed_loop_modes(
@@ -171,23 +208,24 @@ class SCSMART(LightningModule):
                     train_mask=train_mask,
                     observer_player=observer_player,
                     batch_idx=batch_idx,
+                    stage=stage,
                 )
 
         if self.val_closed_loop:
             if "own" in self.closed_loop_rollout_modes:
                 self.log(
-                    "val_closed/ADE_own_rollout", self.minADE_own_rollout,
+                    f"{stage}_closed/ADE_own_rollout", self.minADE_own_rollout,
                     on_epoch=True, sync_dist=True, batch_size=1,
                 )
             if "opponent" in self.closed_loop_rollout_modes:
                 self.log(
-                    "val_closed/ADE_opp_rollout", self.minADE_opp_rollout,
+                    f"{stage}_closed/ADE_opp_rollout", self.minADE_opp_rollout,
                     on_epoch=True, sync_dist=True, batch_size=1,
                 )
 
     def _run_closed_loop_modes(
         self, data, tokenized_map, tokenized_agent, train_mask,
-        observer_player, batch_idx,
+        observer_player, batch_idx, stage: str = "val",
     ):
         """Run the closed-loop rollout for each enabled mode (own/opponent).
 
@@ -226,8 +264,12 @@ class SCSMART(LightningModule):
             keep_mask_e, self.num_historical_steps:, :2
         ]
 
+        # Predictions: all 4 heads (extended from prior 2-key list so the save
+        # helper can decode action class + has_action). GT keys remain for the
+        # GIF visualization block; not saved to disk in v1.
         _AUX_KEYS = (
             "target_pos_pred", "has_target_pos_logits",
+            "action_class_logits", "has_action_logits",
             "gt_rel_target_pos", "gt_has_target_pos",
         )
 
@@ -248,6 +290,7 @@ class SCSMART(LightningModule):
                 )
 
             pred_traj_list = []
+            pred_head_list = []
             aux_target_list = []
             for _ in range(self.n_rollout_closed_val):
                 pred = self.encoder.inference(
@@ -256,19 +299,59 @@ class SCSMART(LightningModule):
                     visibility_gate=vis_to_obs,
                 )
                 pred_traj_list.append(pred["pred_traj_native"])
+                pred_head_list.append(pred["pred_head_native"])
                 if self.use_aux_loss:
                     aux_target_list.append({k: pred[k] for k in _AUX_KEYS})
 
             pred_traj = torch.stack(
                 pred_traj_list, dim=1
             )  # [n_filtered, n_rollout, n_step, 2]
+            pred_head = torch.stack(
+                pred_head_list, dim=1
+            )  # [n_filtered, n_rollout, n_step]
 
             # Overlay native-fps GT onto teacher-forced rows so the teacher-forced
             # side is pixel-exact (the in-decoder override is only 2Hz-accurate).
+            # NOTE: save_rollout_batch reads only metric_scope rows, which are
+            # disjoint from teacher_force_mask, so pred_head intentionally has
+            # no parallel overlay — see assertion inside the helper.
             tf_target_gt = target[teacher_force_mask]  # [n_tf, n_step, 2]
             if tf_target_gt.shape[0] > 0:
                 pred_traj[teacher_force_mask] = tf_target_gt.unsqueeze(1).expand(
                     -1, pred_traj.shape[1], -1, -1
+                )
+
+            # --- Save rollouts to disk for offline metric harness ---
+            if (
+                self.save_closed_rollouts
+                and observer_player in self.save_rollout_observers
+                and mode in self.save_rollout_modes
+            ):
+                save_rollout_batch(
+                    save_dir=self.rollout_save_dir,
+                    data=data,
+                    filt_e=filt_e,
+                    keep_mask_e=keep_mask_e,
+                    metric_scope=metric_scope,
+                    teacher_force_mask=teacher_force_mask,
+                    pred_traj=pred_traj,
+                    pred_head=pred_head,
+                    vis_to_obs=vis_to_obs,
+                    aux_target_list=aux_target_list if self.use_aux_loss else None,
+                    observer_player=observer_player,
+                    mode=mode,
+                    file_attrs={
+                        "num_historical_steps": self.num_historical_steps,
+                        "num_future_steps": int(pred_traj.shape[2]),
+                        "n_rollouts": int(pred_traj.shape[1]),
+                        "native_fps": 16,
+                        "dataset_version": self.dataset_version,
+                        "model_config_hash": self.model_config_hash,
+                        "stage": self.rollout_stage,
+                    },
+                    precision=self.rollout_save_precision,
+                    global_rank=self.global_rank,
+                    world_size=int(self.trainer.world_size),
                 )
 
             scope_valid = target_valid_full & metric_scope.unsqueeze(1)
@@ -329,6 +412,21 @@ class SCSMART(LightningModule):
                             save_path=str(save_dir / f"rollout_{i_roll:02d}.gif"),
                             num_historical_steps=self.num_historical_steps,
                         )
+
+    def setup(self, stage):
+        # Lightning calls setup with stage in {"fit", "validate", "test", "predict"}
+        # or sometimes None (e.g. trainer.tune). Guard the rollout dir for both
+        # eval stages; every rank checks (shared FS → same answer → consistent
+        # raise across ranks → clean DDP shutdown without barrier hang).
+        if stage in ("validate", "test", None) and self.save_closed_rollouts:
+            self.rollout_stage = "test" if stage == "test" else "val"
+            self.rollout_save_dir.mkdir(parents=True, exist_ok=True)
+            existing = list(self.rollout_save_dir.glob("*.h5"))
+            if existing:
+                raise RuntimeError(
+                    f"Rollout dir {self.rollout_save_dir} already contains "
+                    f"{len(existing)} .h5 files. Use a fresh dir."
+                )
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
