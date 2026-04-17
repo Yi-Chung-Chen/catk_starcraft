@@ -64,10 +64,15 @@ class SCDecoder(nn.Module):
         )
 
     def forward(
-        self, tokenized_map: Dict[str, Tensor], tokenized_agent: Dict[str, Tensor]
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        visibility_gate: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         map_feature = self.map_encoder(tokenized_map)
-        return self.agent_encoder(tokenized_agent, map_feature)
+        return self.agent_encoder(
+            tokenized_agent, map_feature, visibility_gate=visibility_gate,
+        )
 
     def inference(
         self,

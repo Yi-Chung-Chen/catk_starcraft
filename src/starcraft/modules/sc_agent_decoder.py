@@ -421,8 +421,21 @@ class SCAgentDecoder(nn.Module):
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
+        visibility_gate: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Open-loop forward pass.
+
+        Args:
+            visibility_gate: [n_agent, n_step] bool. When provided, agents are
+                excluded from attention at steps where the gate is False.
+                Observer / neutral rows are expected to be all-True; opponent
+                rows carry per-step fog-of-war visibility. Threaded through as
+                an AND on the per-step validity mask used by every edge
+                builder and the concept-attention layer.
+        """
         mask = tokenized_agent["valid_mask"]
+        if visibility_gate is not None:
+            mask = mask & visibility_gate
         pos_a = tokenized_agent["sampled_pos"]
         head_a = tokenized_agent["sampled_heading"]
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
@@ -488,7 +501,7 @@ class SCAgentDecoder(nn.Module):
         if self.num_concepts > 0:
             concept_edge_data = self.concept_attn_layers[0].build_concept_edges(
                 owner_idx=tokenized_agent["owner_idx"],
-                valid_mask=tokenized_agent["valid_mask"],
+                valid_mask=mask,
                 batch=tokenized_agent["batch"],
                 n_step=n_step,
                 num_graphs=num_graphs,
@@ -513,18 +526,25 @@ class SCAgentDecoder(nn.Module):
 
         next_token_logits = self.token_predict_head(feat_a)
 
+        # gt_valid_raw is a separate 2Hz validity tensor consumed by the loss
+        # when use_gt_raw=True (default). Fog-gate it independently so the
+        # supervised target validity matches the attention gate.
+        gt_valid_raw_out = tokenized_agent["gt_valid_raw"]
+        if visibility_gate is not None:
+            gt_valid_raw_out = gt_valid_raw_out & visibility_gate
+
         out = {
             "next_token_logits": next_token_logits[:, 1:-1],  # [n_agent, 16, n_token]
-            "next_token_valid": tokenized_agent["valid_mask"][:, 1:-1],
+            "next_token_valid": mask[:, 1:-1],
             "pred_pos": tokenized_agent["sampled_pos"],
             "pred_head": tokenized_agent["sampled_heading"],
-            "pred_valid": tokenized_agent["valid_mask"],
+            "pred_valid": mask,
             "gt_pos_raw": tokenized_agent["gt_pos_raw"],
             "gt_head_raw": tokenized_agent["gt_head_raw"],
-            "gt_valid_raw": tokenized_agent["gt_valid_raw"],
+            "gt_valid_raw": gt_valid_raw_out,
             "gt_pos": tokenized_agent["gt_pos"],
             "gt_head": tokenized_agent["gt_heading"],
-            "gt_valid": tokenized_agent["valid_mask"],
+            "gt_valid": mask,
         }
 
         if self.use_aux_loss:
@@ -560,11 +580,11 @@ class SCAgentDecoder(nn.Module):
                 whose next token is overridden by GT at every rollout step
                 (so their pos/head follow ground truth). Default None disables
                 teacher forcing (pure rollout for all agents).
-            visibility_gate: [n_agent, 18] bool. When provided together with
-                teacher_force_mask, enforces per-step observer visibility on
-                teacher-forced agents: they are removed from attention at
-                steps where the gate is False. Rollout agents stay valid
-                according to their own GT liveness.
+            visibility_gate: [n_agent, 18] bool. Per-step observer visibility.
+                When paired with teacher_force_mask, only teacher-forced rows
+                are gated (rollout agents stay valid per their own GT
+                liveness). When supplied alone (training rollout path),
+                every agent's validity is gated by the mask at every step.
         """
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_step_future_native = self.num_future_steps  # 128
@@ -611,15 +631,22 @@ class SCAgentDecoder(nn.Module):
 
         pred_valid = tokenized_agent["valid_mask"].clone()
 
-        # Fog-of-war gating on historical validity for teacher-forced agents.
-        # Future steps are handled inside the rollout loop (they're overwritten
-        # at each iteration, so a pre-loop gate would be clobbered).
-        if visibility_gate is not None and teacher_force_mask is not None:
-            tf_col = teacher_force_mask.unsqueeze(1)  # [n_agent, 1]
-            pred_valid[:, :step_current_2hz] = (
-                pred_valid[:, :step_current_2hz]
-                & (~tf_col | visibility_gate[:, :step_current_2hz])
-            )
+        # Fog-of-war gating on historical validity. When a teacher_force_mask
+        # is present, only teacher-forced rows are gated; otherwise (training
+        # rollout) every row is gated. Future steps are handled inside the
+        # rollout loop (they'd be clobbered by a pre-loop gate there).
+        if visibility_gate is not None:
+            if teacher_force_mask is not None:
+                tf_col = teacher_force_mask.unsqueeze(1)  # [n_agent, 1]
+                pred_valid[:, :step_current_2hz] = (
+                    pred_valid[:, :step_current_2hz]
+                    & (~tf_col | visibility_gate[:, :step_current_2hz])
+                )
+            else:
+                pred_valid[:, :step_current_2hz] = (
+                    pred_valid[:, :step_current_2hz]
+                    & visibility_gate[:, :step_current_2hz]
+                )
 
         next_token_logits_list = []
         next_token_action_list = []
@@ -767,6 +794,16 @@ class SCAgentDecoder(nn.Module):
                 aux_action_list.append(aux_action_logits)
                 aux_target_pos_list.append(self.target_pos_head(feat_a_now))
 
+            # Gate valid_next_gt by visibility: the CAT-K sampler
+            # (topk_prob_sampled_with_dist) uses valid_next_gt to decide
+            # whether to steer token selection toward GT. Without the gate,
+            # fog-hidden opponents would be steered by their hidden GT
+            # position — a leak of unobserved motion into the rollout.
+            # Falls back to pure probability (like topk_prob) at gated steps.
+            valid_next_gt = tokenized_agent["gt_valid_raw"][:, n_step]
+            if visibility_gate is not None:
+                valid_next_gt = valid_next_gt & visibility_gate[:, n_step]
+
             next_token_idx, next_token_traj_all = (
                 sample_next_token_traj_contour(
                     token_traj=token_traj,
@@ -777,7 +814,7 @@ class SCAgentDecoder(nn.Module):
                     head_now=head_a[:, t_now],
                     pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
                     head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
-                    valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
+                    valid_next_gt=valid_next_gt,
                 )
             )  # next_token_traj_all: [n_agent, 9, 4, 2] in local coords
 
@@ -845,6 +882,17 @@ class SCAgentDecoder(nn.Module):
                 )
                 pred_valid[:, n_step] = torch.where(
                     teacher_force_mask, tf_next_valid, rollout_next_valid
+                )
+            elif visibility_gate is not None:
+                # Training rollout: gate every agent by GT liveness AND fog
+                # at this exact step. We look up both at n_step (not propagate
+                # from t_now) so late-observed opponents and late-spawn units
+                # can enter attention at the right step, matching the
+                # open-loop forward path's per-step mask semantics. GT
+                # valid_mask already encodes "once dead, stay dead."
+                pred_valid[:, n_step] = (
+                    tokenized_agent["valid_mask"][:, n_step]
+                    & visibility_gate[:, n_step]
                 )
             else:
                 pred_valid[:, n_step] = rollout_next_valid
@@ -915,6 +963,16 @@ class SCAgentDecoder(nn.Module):
 
             feat_a = torch.cat([feat_a, feat_a_next], dim=1)
 
+        # gt_valid / gt_valid_raw are the target-validity fields consumed by
+        # SCCrossEntropy (when training's rollout path calls inference). Both
+        # must be fog-gated to match the forward path; otherwise the loss
+        # supervises fog-hidden target tokens.
+        gt_valid_out = tokenized_agent["valid_mask"]
+        gt_valid_raw_out = tokenized_agent["gt_valid_raw"]
+        if visibility_gate is not None:
+            gt_valid_out = gt_valid_out & visibility_gate
+            gt_valid_raw_out = gt_valid_raw_out & visibility_gate
+
         out_dict = {
             "next_token_logits": torch.stack(next_token_logits_list, dim=1),
             "next_token_valid": pred_valid[:, 1:-1],
@@ -924,10 +982,10 @@ class SCAgentDecoder(nn.Module):
             "pred_idx": pred_idx,
             "gt_pos_raw": tokenized_agent["gt_pos_raw"],
             "gt_head_raw": tokenized_agent["gt_head_raw"],
-            "gt_valid_raw": tokenized_agent["gt_valid_raw"],
+            "gt_valid_raw": gt_valid_raw_out,
             "gt_pos": tokenized_agent["gt_pos"],
             "gt_head": tokenized_agent["gt_heading"],
-            "gt_valid": tokenized_agent["valid_mask"],
+            "gt_valid": gt_valid_out,
             "next_token_action": torch.stack(next_token_action_list, dim=1),
         }
 

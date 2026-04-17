@@ -66,18 +66,28 @@ class SCSMART(LightningModule):
         tokenized_map, tokenized_agent = self.token_processor(data)
         train_mask = data["agent"]["train_mask"]
 
-        # Randomly choose one observer perspective per step
+        # Randomly choose one observer perspective per step.
+        # opponent_keep_mode="visible_ever" keeps late-observed opponents in
+        # the roster so the observer's input matches what an observer would
+        # actually know mid-window (same roster the closed-loop evaluator
+        # uses); vis_to_obs gates their attention edges per step.
         observer_player = 1 if torch.rand(1).item() < 0.5 else 2
-        filtered_agent, obs_mask, opp_mask, _, _ = filter_agents_for_perspective(
-            tokenized_agent, train_mask, observer_player,
+        filtered_agent, obs_mask, opp_mask, _, vis_to_obs = (
+            filter_agents_for_perspective(
+                tokenized_agent, train_mask, observer_player,
+                opponent_keep_mode="visible_ever",
+            )
         )
 
         if self.training_rollout_sampling.num_k <= 0:
-            pred = self.encoder(tokenized_map, filtered_agent)
+            pred = self.encoder(
+                tokenized_map, filtered_agent, visibility_gate=vis_to_obs,
+            )
         else:
             pred = self.encoder.inference(
                 tokenized_map, filtered_agent,
                 sampling_scheme=self.training_rollout_sampling,
+                visibility_gate=vis_to_obs,
             )
 
         # Trajectory loss: observer + opponent units
@@ -108,14 +118,20 @@ class SCSMART(LightningModule):
 
         # Run both perspectives for complete metrics
         for observer_player in [1, 2]:
-            # Status-quo filter (drops late-observed opponents) for open-loop.
-            filtered_agent, obs_mask, opp_mask, _, _ = filter_agents_for_perspective(
-                tokenized_agent, train_mask, observer_player,
+            # Expanded roster (matches training) so open-loop val measures the
+            # same context the training signal was built on.
+            filtered_agent, obs_mask, opp_mask, _, vis_to_obs = (
+                filter_agents_for_perspective(
+                    tokenized_agent, train_mask, observer_player,
+                    opponent_keep_mode="visible_ever",
+                )
             )
             combined_mask = obs_mask | opp_mask
 
             if self.val_open_loop:
-                pred = self.encoder(tokenized_map, filtered_agent)
+                pred = self.encoder(
+                    tokenized_map, filtered_agent, visibility_gate=vis_to_obs,
+                )
                 loss = self.training_loss(
                     **pred,
                     token_agent_shape=filtered_agent["token_agent_shape"],
@@ -127,11 +143,22 @@ class SCSMART(LightningModule):
                     for k, v in self.action_target_loss.batch_components().items():
                         self.log(f"val_open/loss_{k}", v, on_epoch=True, sync_dist=True, batch_size=1)
 
+                # pred_valid uses source-step validity (the step the
+                # prediction is made from). target_valid uses next-step
+                # validity (the step the GT token actually represents, after
+                # fog gating) so we don't score accuracy against tokens of
+                # dead or fog-hidden agents.
+                pred_valid = pred["next_token_valid"] & combined_mask.unsqueeze(1)
+                target_valid = (
+                    filtered_agent["valid_mask"][:, 2:]
+                    & vis_to_obs[:, 2:]
+                    & combined_mask.unsqueeze(1)
+                )
                 self.TokenCls.update(
                     pred=pred["next_token_logits"],
-                    pred_valid=pred["next_token_valid"] & combined_mask.unsqueeze(1),
+                    pred_valid=pred_valid,
                     target=filtered_agent["gt_idx"][:, 2:],
-                    target_valid=filtered_agent["valid_mask"][:, 2:] & combined_mask.unsqueeze(1),
+                    target_valid=target_valid,
                 )
                 self.log("val_open/acc", self.TokenCls, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("val_open/loss_motion", loss, on_epoch=True, sync_dist=True, batch_size=1)
