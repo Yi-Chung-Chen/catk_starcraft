@@ -63,20 +63,30 @@ _SHARED_KEYS = frozenset({
 })
 
 
+_OPPONENT_KEEP_MODES = ("visible_now", "visible_ever", "all")
+
+
 def filter_agents_for_perspective(
     tokenized_agent: Dict[str, Tensor],
     train_mask: Tensor,
     observer_player: int,
     min_future_visible: int = 8,
-    include_all_opponents: bool = False,
+    opponent_keep_mode: str = "visible_now",
 ) -> Tuple[Dict[str, Tensor], Tensor, Tensor, Tensor, Tensor]:
     """Filter agents to observer's perspective and build per-role train masks.
 
-    With default ``include_all_opponents=False`` (used for training and open-loop
-    validation), drops opponent units not visible at the current frame entirely.
-    With ``include_all_opponents=True`` (used for closed-loop teacher-forcing
-    modes), keeps every opponent in the roster so late-observed opponents can
-    serve as GT-teacher-forced context once the observer would spot them.
+    ``opponent_keep_mode`` controls which opponent units survive the filter:
+
+    - ``"visible_now"`` (default, used for training and open-loop validation):
+      keep only opponents visible to the observer at the current frame
+      (token step 1 = frame 16). Historical default.
+    - ``"visible_ever"``: keep opponents visible at the current frame *or* at
+      any future step (token steps 1..17). Permanently-unseen opponents are
+      dropped. Intended for closed-loop teacher-forcing eval so late-observed
+      opponents can enter attention when the observer would spot them.
+    - ``"all"``: keep every opponent regardless of visibility. Debug /
+      completeness option; leaves permanently-unseen opponents as zero-edge
+      nodes after fog-of-war gating.
 
     Remaps ``owner_idx`` to 0=observer, 1=opponent, 2=neutral.  Zeros out
     intent fields for non-observer units.
@@ -94,22 +104,34 @@ def filter_agents_for_perspective(
             always True; opponents follow the raw ``visible_status`` decoding.
             Intended for fog-of-war gating in teacher-force rollout modes.
     """
-    owner = tokenized_agent["owner"]  # [n_agent], values {1, 2, 16}
+    if opponent_keep_mode not in _OPPONENT_KEEP_MODES:
+        raise ValueError(
+            f"Unknown opponent_keep_mode '{opponent_keep_mode}'. "
+            f"Valid options: {_OPPONENT_KEEP_MODES}."
+        )
 
-    # --- Visibility at current frame (token step 1 = raw frame 16) ---
-    vis_at_current = tokenized_agent["visible_status"][:, 1]
+    owner = tokenized_agent["owner"]  # [n_agent], values {1, 2, 16}
+    visible_status = tokenized_agent["visible_status"]  # [n_agent, 18]
+
+    # Decode observer's visibility across all steps once; reused below.
     if observer_player == 1:
-        observer_sees = (vis_at_current // 3) == 2
+        observer_sees_per_step = (visible_status // 3) == 2
     else:
-        observer_sees = (vis_at_current % 3) == 2
+        observer_sees_per_step = (visible_status % 3) == 2
+    # Current-frame visibility is stored at token step 1 (frame 16).
+    observer_sees = observer_sees_per_step[:, 1]
+    # Current or any future step (tokens 1..17).
+    observer_sees_ever = observer_sees_per_step[:, 1:].any(dim=1)
 
     is_own = owner == observer_player
     is_neutral = owner == 16
     is_opponent = ~is_own & ~is_neutral
-    if include_all_opponents:
-        keep_mask = is_own | is_neutral | is_opponent
-    else:
+    if opponent_keep_mode == "visible_now":
         keep_mask = is_own | is_neutral | (is_opponent & observer_sees)
+    elif opponent_keep_mode == "visible_ever":
+        keep_mask = is_own | is_neutral | (is_opponent & observer_sees_ever)
+    else:  # "all"
+        keep_mask = is_own | is_neutral | is_opponent
 
     # --- Filter all per-agent tensors ---
     out: Dict[str, Tensor] = {}
@@ -153,12 +175,7 @@ def filter_agents_for_perspective(
     observer_train_mask = filtered_train_mask & is_observer
 
     # Opponent train mask: additionally require future visibility >= threshold
-    vis_future = tokenized_agent["visible_status"][:, 2:]  # [n_agent, 16] future steps
-    if observer_player == 1:
-        future_vis_decoded = (vis_future // 3) == 2
-    else:
-        future_vis_decoded = (vis_future % 3) == 2
-    future_visible_count = future_vis_decoded[keep_mask].sum(-1)  # [n_filtered]
+    future_visible_count = observer_sees_per_step[keep_mask, 2:].sum(-1)  # [n_filtered]
     opponent_train_mask = (
         filtered_train_mask
         & ~is_observer
@@ -167,12 +184,9 @@ def filter_agents_for_perspective(
     )
 
     # --- Per-step visibility to observer (for fog-of-war gating) ---
-    vs = out["visible_status"]  # [n_filtered, 18]
-    if observer_player == 1:
-        vis_to_obs = (vs // 3) == 2
-    else:
-        vis_to_obs = (vs % 3) == 2
-    # Observer's own units and neutrals are always visible to the observer.
+    # Reuse the decoded per-step visibility from before the filter and
+    # restrict to kept agents; observer/neutral rows are forced True below.
+    vis_to_obs = observer_sees_per_step[keep_mask]
     vis_to_obs = (
         vis_to_obs
         | is_observer.unsqueeze(1)

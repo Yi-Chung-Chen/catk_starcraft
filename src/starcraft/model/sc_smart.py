@@ -164,15 +164,19 @@ class SCSMART(LightningModule):
     ):
         """Run the closed-loop rollout for each enabled mode (own/opponent).
 
-        Uses the expanded roster (include_all_opponents=True) so late-observed
-        opponents can serve as GT-teacher-forced context. Fog-of-war visibility
-        is threaded into the decoder's inference() via visibility_gate.
+        Uses the expanded roster (opponent_keep_mode="visible_ever") so
+        late-observed opponents can serve as GT-teacher-forced context.
+        Fog-of-war visibility is threaded into the decoder's inference()
+        via visibility_gate.
         """
-        # Expanded filter: keep late-observed opponents in the roster.
+        # Expanded filter: keep opponents visible at frame 16 or any future
+        # step so late-observed opponents can enter attention post-reveal.
+        # Permanently-unseen opponents are still dropped (they would be
+        # zero-edge dead nodes under fog-of-war gating anyway).
         filt_e, obs_mask_e, opp_mask_e, keep_mask_e, vis_to_obs = (
             filter_agents_for_perspective(
                 tokenized_agent, train_mask, observer_player,
-                include_all_opponents=True,
+                opponent_keep_mode="visible_ever",
             )
         )
         is_observer = filt_e["is_observer"]
