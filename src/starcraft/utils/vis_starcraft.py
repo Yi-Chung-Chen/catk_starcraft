@@ -17,7 +17,8 @@ FPS = 16  # native frame rate
 
 def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
                           num_historical_steps=17, aux_target_data=None,
-                          map_data_dir=None, pred_valid_mask=None):
+                          map_data_dir=None, pred_valid_mask=None,
+                          observer_player=None, target_mask=None):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -29,6 +30,16 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
             (num_historical_steps - 1) to have valid predictions.
         aux_target_data: Optional dict with target_pos_pred, has_target_pos_logits,
             gt_rel_target_pos, gt_has_target_pos tensors (batch-level).
+        observer_player: Optional int (1 or 2). When provided, aux intent
+            fields (`gt_target_rel`, `gt_has_target`, `pred_target_rel`,
+            `pred_has_target`) are zeroed for non-observer rows. Non-observer
+            GT is already zeroed by filter_agents_for_perspective, but
+            non-observer aux head predictions are untrained garbage and must
+            not be rendered.
+        target_mask: Optional (N_total,) bool. When provided, `pred_agent_mask`
+            is further narrowed to this mask — diamond markers and pred
+            trails then appear only for units of interest under the current
+            observer/mode (the same rows saved by the rollout I/O layer).
 
     Returns:
         Dict with numpy arrays for one scenario + one rollout.
@@ -45,6 +56,8 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
     pred_agent_mask = valid[:, current_frame].cpu().numpy()
     if pred_valid_mask is not None:
         pred_agent_mask = pred_agent_mask & pred_valid_mask[mask].cpu().numpy()
+    if target_mask is not None:
+        pred_agent_mask = pred_agent_mask & target_mask[mask].cpu().numpy()
 
     out = {
         "gt_positions": data["agent"]["position"][mask, :, :2].cpu().numpy(),
@@ -56,10 +69,24 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
     }
 
     if aux_target_data is not None:
-        out["pred_target_rel"] = aux_target_data["target_pos_pred"][mask].cpu().numpy()
-        out["pred_has_target"] = (aux_target_data["has_target_pos_logits"][mask] > 0).cpu().numpy()
-        out["gt_target_rel"] = aux_target_data["gt_rel_target_pos"][mask].cpu().numpy()
-        out["gt_has_target"] = aux_target_data["gt_has_target_pos"][mask].cpu().numpy()
+        pred_target_rel = aux_target_data["target_pos_pred"][mask].cpu().numpy()
+        pred_has_target = (aux_target_data["has_target_pos_logits"][mask] > 0).cpu().numpy()
+        gt_target_rel = aux_target_data["gt_rel_target_pos"][mask].cpu().numpy()
+        gt_has_target = aux_target_data["gt_has_target_pos"][mask].cpu().numpy()
+        # Non-observer rows: aux heads run on every agent but are untrained
+        # for opponents/neutrals (loss uses obs_mask), so their predictions
+        # are meaningless. GT is already zeroed by filter_agents_for_perspective
+        # but we zero it here too for symmetry.
+        if observer_player is not None:
+            is_observer = data["agent"]["owner"][mask].cpu().numpy() == observer_player
+            pred_target_rel[~is_observer] = 0.0
+            pred_has_target[~is_observer] = False
+            gt_target_rel[~is_observer] = 0.0
+            gt_has_target[~is_observer] = False
+        out["pred_target_rel"] = pred_target_rel
+        out["pred_has_target"] = pred_has_target
+        out["gt_target_rel"] = gt_target_rel
+        out["gt_has_target"] = gt_has_target
 
     if map_data_dir is not None:
         map_names = data["map_name"]

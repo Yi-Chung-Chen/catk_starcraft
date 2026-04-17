@@ -376,6 +376,15 @@ class SCSMART(LightningModule):
                 )
                 full_pred_traj[keep_mask_e] = pred_traj
 
+                # Units of interest for this (observer, mode): the same
+                # metric_scope rows the rollout I/O saves. Scattered back
+                # onto the full N_total roster so extract_scenario_data can
+                # narrow diamond/pred-trail rendering to these agents.
+                target_mask_full = torch.zeros(
+                    N_total, dtype=torch.bool, device=metric_scope.device,
+                )
+                target_mask_full[keep_mask_e] = metric_scope
+
                 n_scenarios = min(self.n_vis_scenario, data.num_graphs)
                 n_rollouts_vis = min(self.n_vis_rollout, full_pred_traj.shape[1])
                 obs_tag = f"obs_p{observer_player}"
@@ -398,6 +407,8 @@ class SCSMART(LightningModule):
                             aux_target_data=aux_data,
                             map_data_dir=self.token_processor.map_data_dir,
                             pred_valid_mask=keep_mask_e,
+                            observer_player=observer_player,
+                            target_mask=target_mask_full,
                         )
                         save_dir = (
                             self.gif_dir
