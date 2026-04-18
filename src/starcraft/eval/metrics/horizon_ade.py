@@ -13,7 +13,7 @@ from src.starcraft.eval.load_rollout import ScenarioRollout
 _HORIZONS = (1, 3, 5, 8)
 
 
-def compute(scenario: ScenarioRollout) -> list:
+def compute(scenario: ScenarioRollout, ctx=None) -> list:
     pred = scenario.pred_traj.astype(np.float32)        # [N, R, T, 2]
     gt = scenario.gt_traj.astype(np.float32)            # [N, T, 2]
     valid = scenario.gt_valid.astype(bool)              # [N, T]

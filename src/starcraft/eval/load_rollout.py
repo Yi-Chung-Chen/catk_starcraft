@@ -6,6 +6,12 @@ column on the rollout side joins back to the post-`ever_alive` row ordering
 on the replay side. The `ever_alive` filter is reapplied here from the same
 helper the dataset uses so any future drift in the filter logic doesn't
 silently misjoin.
+
+Beyond the metric-scope rows, the loader also returns a **scene GT** view
+covering every other ever-alive agent in the replay (opposite side,
+non-scope same-side units, neutrals). Interaction metrics consume this to
+build a mixed scene (metric-scope predictions + GT of everyone else) that
+matches the teacher-forcing conditioning used at rollout time.
 """
 
 from __future__ import annotations
@@ -45,6 +51,17 @@ class ScenarioRollout:
     gt_valid: Optional[np.ndarray] = None        # [N_target, 128] bool — already AND'd with alive_at_current
     gt_alive_at_current: Optional[np.ndarray] = None  # [N_target] bool — alive at frame 16
     gt_radius: Optional[np.ndarray] = None       # [N_target] fp32
+    gt_is_flying: Optional[np.ndarray] = None    # [N_target, 128] bool — per-step flying state
+
+    # Scene-wide GT for inter-agent metrics: all ever-alive agents NOT in
+    # metric_scope (opposite side, non-scope same-side, neutrals). Positions,
+    # radii, validity, flying state, owner.
+    gt_scene_traj: Optional[np.ndarray] = None        # [M, 128, 2]
+    gt_scene_head: Optional[np.ndarray] = None        # [M, 128]
+    gt_scene_valid: Optional[np.ndarray] = None       # [M, 128] bool
+    gt_scene_radius: Optional[np.ndarray] = None      # [M] fp32
+    gt_scene_is_flying: Optional[np.ndarray] = None   # [M, 128] bool
+    gt_scene_owner: Optional[np.ndarray] = None       # [M] int (1, 2, 16)
 
     # Provenance
     dataset_version: str = ""
@@ -54,25 +71,43 @@ class ScenarioRollout:
 
 def _load_replay_gt(
     replay_path: Path, agent_id: np.ndarray, num_historical_steps: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Read raw replay, apply ever_alive filter, join by agent_id.
+) -> dict:
+    """Read raw replay, apply ever_alive filter, build metric-scope GT and
+    scene-wide GT in one pass.
+
+    Returns a dict with keys:
+        metric-scope (joined to `agent_id`):
+            gt_traj, gt_head, gt_valid, alive_at_current, gt_radius, gt_is_flying
+        scene-wide (everyone ever-alive except metric-scope tags):
+            scene_traj, scene_head, scene_valid, scene_radius,
+            scene_is_flying, scene_owner
 
     Raises ValueError if any saved agent_id is not found in the replay after
     the ever_alive filter — fail loud rather than silently produce wrong joins.
     """
     with h5py.File(replay_path, "r") as f:
         unit_tag = f["unit_data"]["global"]["unit_tag"][:]
+        owner = f["unit_data"]["global"]["unit_owner"][:]
         is_alive = f["unit_data"]["repeated"]["is_alive"][:].astype(bool)
         coordinate = f["unit_data"]["repeated"]["coordinate"][:].astype(np.float32)
         heading = f["unit_data"]["repeated"]["heading"][:].astype(np.float32)
         radius = f["unit_data"]["repeated"]["radius"][:].astype(np.float32)
+        # is_flying may be missing in older preprocessings; fall back to all-False
+        # so map-violation metric still runs (will over-count any flyers, but
+        # won't hard-fail the eval).
+        if "is_flying" in f["unit_data"]["repeated"]:
+            is_flying = f["unit_data"]["repeated"]["is_flying"][:].astype(bool)
+        else:
+            is_flying = np.zeros_like(is_alive)
 
     keep_idx = apply_ever_alive_filter(is_alive)
     unit_tag_kept = unit_tag[keep_idx]
+    owner_kept = owner[keep_idx]
     is_alive_kept = is_alive[:, keep_idx]
     coord_kept = coordinate[:, keep_idx]
     head_kept = heading[:, keep_idx]
     radius_kept = radius[:, keep_idx]
+    is_flying_kept = is_flying[:, keep_idx]
 
     tag_to_idx = {int(t): i for i, t in enumerate(unit_tag_kept)}
     try:
@@ -90,6 +125,7 @@ def _load_replay_gt(
     fut_alive = is_alive_kept[num_historical_steps:, join_idx].T   # (N, 128)
     fut_coord = coord_kept[num_historical_steps:, join_idx, :2].transpose(1, 0, 2)  # (N, 128, 2)
     fut_head = head_kept[num_historical_steps:, join_idx].T        # (N, 128)
+    fut_flying = is_flying_kept[num_historical_steps:, join_idx].T  # (N, 128)
     # alive_at_current = valid_mask at the LAST historical step (frame 16).
     # Live minADE uses target_valid_full = valid_mask[:, num_hist:] & alive_at_current,
     # so we mirror exactly: AND fut_alive with alive_at_current here.
@@ -98,7 +134,41 @@ def _load_replay_gt(
     # Radius at current frame (consistent with SCDataset's snapshot at frame 16)
     rad_now = radius_kept[num_historical_steps - 1, join_idx]
 
-    return fut_coord, fut_head, fut_alive_gated, alive_at_current, rad_now
+    # Scene rows = everything ever-alive EXCEPT the metric-scope tags. We index
+    # into the kept arrays (not the raw arrays) so the `_kept` slicing stays
+    # aligned with ever_alive order.
+    scope_tags = set(int(t) for t in agent_id)
+    scene_mask = np.array(
+        [int(t) not in scope_tags for t in unit_tag_kept], dtype=bool,
+    )
+
+    scene_alive = is_alive_kept[num_historical_steps:, scene_mask].T            # (M, 128)
+    scene_coord = coord_kept[num_historical_steps:, scene_mask, :2].transpose(1, 0, 2)  # (M, 128, 2)
+    scene_head = head_kept[num_historical_steps:, scene_mask].T                  # (M, 128)
+    scene_flying = is_flying_kept[num_historical_steps:, scene_mask].T           # (M, 128)
+    # For scene agents we can't gate on "alive_at_current" in the same way —
+    # they weren't the observer's predicted targets. Use raw future alive as
+    # validity (an agent that dies mid-window should stop contributing to
+    # pairwise distance at that point).
+    scene_radius = radius_kept[num_historical_steps - 1, scene_mask]              # (M,)
+    scene_owner = owner_kept[scene_mask]                                          # (M,)
+
+    return {
+        # metric-scope
+        "gt_traj": fut_coord,
+        "gt_head": fut_head,
+        "gt_valid": fut_alive_gated,
+        "alive_at_current": alive_at_current,
+        "gt_radius": rad_now,
+        "gt_is_flying": fut_flying,
+        # scene
+        "scene_traj": scene_coord,
+        "scene_head": scene_head,
+        "scene_valid": scene_alive,
+        "scene_radius": scene_radius,
+        "scene_is_flying": scene_flying,
+        "scene_owner": scene_owner,
+    }
 
 
 def load_rollout(
@@ -153,7 +223,7 @@ def load_rollout(
         if "aux" in grp:
             aux = {k: grp["aux"][k][:] for k in grp["aux"].keys()}
 
-    gt_traj = gt_head = gt_valid = gt_alive_at_current = gt_radius = None
+    gt_kwargs: dict = {}
     if join_gt:
         # Dataset layout: {replays_dir}/{split}/{map_name}/{scenario_id}.h5
         # where split ∈ {train, val, test}. The save layer stamps `stage` into
@@ -176,9 +246,21 @@ def load_rollout(
                 f"Tried: {[str(p) for p in candidates]}. "
                 "Expected layout: {replays_dir}/{split}/{map_name}/{scenario_id}.h5"
             )
-        gt_traj, gt_head, gt_valid, gt_alive_at_current, gt_radius = _load_replay_gt(
-            replay_path, agent_id, num_historical_steps,
-        )
+        g = _load_replay_gt(replay_path, agent_id, num_historical_steps)
+        gt_kwargs = {
+            "gt_traj": g["gt_traj"],
+            "gt_head": g["gt_head"],
+            "gt_valid": g["gt_valid"],
+            "gt_alive_at_current": g["alive_at_current"],
+            "gt_radius": g["gt_radius"],
+            "gt_is_flying": g["gt_is_flying"],
+            "gt_scene_traj": g["scene_traj"],
+            "gt_scene_head": g["scene_head"],
+            "gt_scene_valid": g["scene_valid"],
+            "gt_scene_radius": g["scene_radius"],
+            "gt_scene_is_flying": g["scene_is_flying"],
+            "gt_scene_owner": g["scene_owner"],
+        }
 
     return ScenarioRollout(
         scenario_id=scenario_id,
@@ -193,12 +275,8 @@ def load_rollout(
         pred_head=pred_head,
         visible_to_obs_future=vis_future,
         aux=aux,
-        gt_traj=gt_traj,
-        gt_head=gt_head,
-        gt_valid=gt_valid,
-        gt_alive_at_current=gt_alive_at_current,
-        gt_radius=gt_radius,
         dataset_version=dataset_version,
         model_config_hash=model_config_hash,
         stage=stage,
+        **gt_kwargs,
     )
