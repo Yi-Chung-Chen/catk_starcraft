@@ -1,20 +1,17 @@
-"""Estimate KDE bandwidths for the StarCraft rollout NLL metrics.
+"""Measure per-feature GT sigma for the StarCraft rollout NLL metrics.
 
-For each KDE feature used by `kinematic_nll` and `interaction_nll`, this
-script pools GT feature values across a whole rollout directory and applies
-Silverman's rule-of-thumb `bw = 1.06 * σ * n^{-1/5}` to derive a per-metric
-bandwidth. Collision and map-violation metrics are Bernoulli and have no
-bandwidth, so they're excluded.
+Walks raw replay HDF5s under `{replays_dir}/{split}/{map}/*.h5`, applies the
+same ever_alive and teleport-filter gates the eval uses, pools the five
+kinematic/interaction GT features, and reports σ per feature.
 
-The emitted flag string can be pasted into `eval_sc_rollouts.py` via
-`--kde_bandwidths`.
+σ is the measurement. Eval-time bandwidth is derived via Silverman's rule
+from σ + R (see src/starcraft/eval/feature_stats.py). To refresh the values
+committed in `FEATURE_SIGMAS`, run this once and paste the sigma table.
 
 Usage:
     python scripts/estimate_kde_bandwidths.py \\
-      --rollouts_dir logs/<run>/rollouts \\
-      --replays_dir  datasets/StarCraftMotion_split_v2_adversarial \\
-      --observers 1,2 --modes own,opponent \\
-      --n_workers 8
+      --replays_dir datasets/StarCraftMotion_split_v2_adversarial \\
+      --splits train
 """
 
 from __future__ import annotations
@@ -27,189 +24,173 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List
 
-# Ensure repo root is importable when invoked as a plain script.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import h5py
 import numpy as np
 
 from src.starcraft.eval.kinematics import (
-    compute_angular_accel,
     compute_angular_speed,
     compute_linear_accel,
     compute_speed,
     pairwise_signed_distance,
+    teleport_free_mask,
 )
-from src.starcraft.eval.load_rollout import load_rollout
+from src.starcraft.utils.sc_replay_io import apply_ever_alive_filter
 
 
+# angular_accel dropped on purpose — SC2 units can switch heading instantly,
+# so Δω/dt isn't a meaningful physical constraint (see kinematic_nll.py).
 _FEATURE_NAMES = (
     "linear_speed_nll",
     "linear_accel_nll",
     "angular_speed_nll",
-    "angular_accel_nll",
     "distance_to_nearest_nll",
 )
 
 
-def _extract_gt_features(scenario) -> Dict[str, np.ndarray]:
-    """Compute the five GT features and flatten valid entries per scenario.
+def _extract_features(
+    replay_path: Path, num_historical_steps: int, native_fps: int,
+) -> Dict[str, np.ndarray]:
+    """Open one replay, slice the future window, compute five GT features.
 
-    Returns a dict feature_name → 1-D array of valid values.
+    Returns flat 1-D arrays of valid values per feature. Pooling across
+    replays preserves the dataset-wide std.
     """
-    dt = 1.0 / float(scenario.native_fps)
-    gt_traj = scenario.gt_traj.astype(np.float32)          # [N, T, 2]
-    gt_head = scenario.gt_head.astype(np.float32)          # [N, T]
-    valid = scenario.gt_valid.astype(bool)                 # [N, T]
-    gt_radius = scenario.gt_radius.astype(np.float32)
+    with h5py.File(replay_path, "r") as f:
+        is_alive = f["unit_data"]["repeated"]["is_alive"][:].astype(bool)
+        coord = f["unit_data"]["repeated"]["coordinate"][:].astype(np.float32)
+        heading = f["unit_data"]["repeated"]["heading"][:].astype(np.float32)
+        radius = f["unit_data"]["repeated"]["radius"][:].astype(np.float32)
 
-    speed_valid = valid[:, 1:] & valid[:, :-1]             # [N, T-1]
-    accel_valid = valid[:, 2:] & valid[:, 1:-1] & valid[:, :-2]  # [N, T-2]
+    keep = apply_ever_alive_filter(is_alive)
+    is_alive = is_alive[:, keep]
+    coord = coord[:, keep, :2]
+    heading = heading[:, keep]
+    radius_now = radius[num_historical_steps - 1, keep]
 
-    gt_speed = compute_speed(gt_traj, dt)                  # [N, T-1]
-    gt_accel = compute_linear_accel(gt_speed, dt)          # [N, T-2]
-    gt_ang_speed = compute_angular_speed(gt_head, dt)      # [N, T-1]
-    gt_ang_accel = compute_angular_accel(gt_ang_speed, dt)  # [N, T-2]
+    # Mirror the ScenarioRollout convention: future window sliced after
+    # num_historical_steps, AND'd with alive_at_current so steps from
+    # currently-dead agents don't contribute.
+    alive_now = is_alive[num_historical_steps - 1]              # (N,)
+    gt_traj = coord[num_historical_steps:].transpose(1, 0, 2)    # (N, T, 2)
+    gt_head = heading[num_historical_steps:].T                   # (N, T)
+    gt_valid = is_alive[num_historical_steps:].T & alive_now[:, None]  # (N, T)
+
+    dt = 1.0 / float(native_fps)
+    N, T = gt_valid.shape
+
+    # Kinematic masks: need consecutive valid timesteps AND non-teleport step.
+    no_tele = teleport_free_mask(gt_traj, dt)                    # (N, T-1)
+    speed_valid = gt_valid[:, 1:] & gt_valid[:, :-1] & no_tele
+    accel_valid = (
+        gt_valid[:, 2:] & gt_valid[:, 1:-1] & gt_valid[:, :-2]
+        & no_tele[:, 1:] & no_tele[:, :-1]
+    )
+
+    gt_speed = compute_speed(gt_traj, dt)
+    gt_accel = compute_linear_accel(gt_speed, dt)
+    gt_ang_speed = compute_angular_speed(gt_head, dt)
 
     out: Dict[str, np.ndarray] = {
         "linear_speed_nll": gt_speed[speed_valid],
         "linear_accel_nll": gt_accel[accel_valid],
         "angular_speed_nll": gt_ang_speed[speed_valid],
-        "angular_accel_nll": gt_ang_accel[accel_valid],
     }
 
-    # Distance-to-nearest: pool GT positions of scope agents AND all scene
-    # agents, then for each (scope agent, valid t) take min signed distance
-    # to any other agent valid at t.
-    scene_traj = scenario.gt_scene_traj
-    scene_radius = scenario.gt_scene_radius
-    scene_valid = scenario.gt_scene_valid
-
-    INF = np.float32(1e9)
-    N = gt_traj.shape[0]
-    T = gt_traj.shape[1]
-
+    # Distance-to-nearest on the full GT scene.
     if N >= 2:
-        d_ss = pairwise_signed_distance(gt_traj, gt_radius, gt_traj, gt_radius)
-        pv = valid[:, None, :] & valid[None, :, :]          # [N, N, T]
-        eye = np.eye(N, dtype=bool)[:, :, None]
-        pv = pv & ~eye
-        d_ss_m = np.where(pv, d_ss, INF)
+        INF = np.float32(1e9)
+        d = pairwise_signed_distance(gt_traj, radius_now, gt_traj, radius_now)
+        pv = gt_valid[:, None, :] & gt_valid[None, :, :]
+        pv = pv & ~np.eye(N, dtype=bool)[:, :, None]
+        d_masked = np.where(pv, d, INF)
+        min_dist = d_masked.min(axis=1)                          # (N, T)
+        dist_valid = gt_valid & pv.any(axis=1)
+        out["distance_to_nearest_nll"] = min_dist[dist_valid]
     else:
-        d_ss_m = np.full((N, 1, T), INF, dtype=np.float32)
+        out["distance_to_nearest_nll"] = np.array([], dtype=np.float32)
 
-    if scene_traj is not None and scene_traj.shape[0] > 0:
-        d_sc = pairwise_signed_distance(
-            gt_traj, gt_radius,
-            scene_traj.astype(np.float32), scene_radius.astype(np.float32),
-        )
-        pv_sc = valid[:, None, :] & scene_valid.astype(bool)[None, :, :]
-        d_sc_m = np.where(pv_sc, d_sc, INF)
-        min_sc = d_sc_m.min(axis=1)
-    else:
-        min_sc = np.full((N, T), INF, dtype=np.float32)
-
-    min_ss = d_ss_m.min(axis=1)                              # [N, T]
-    min_all = np.minimum(min_ss, min_sc)                     # [N, T]
-    has_other = (d_ss_m < INF).any(axis=1) | (min_sc < INF)
-    dist_valid = valid & has_other                           # [N, T]
-    out["distance_to_nearest_nll"] = min_all[dist_valid]
-
-    return out
+    return {k: v.astype(np.float32) for k, v in out.items()}
 
 
-def _process_file(
-    rollout_path: Path,
-    replays_dir: Path,
-    observers: List[int],
-    modes: List[str],
-) -> Dict[str, List[np.ndarray]]:
-    """Return per-feature list of flat value arrays from one scenario file."""
-    buf: Dict[str, List[np.ndarray]] = {k: [] for k in _FEATURE_NAMES}
-    for obs in observers:
-        for mode in modes:
-            try:
-                scenario = load_rollout(rollout_path, replays_dir, obs, mode)
-            except KeyError:
+def _worker(
+    replay_path: Path, num_historical_steps: int, native_fps: int,
+) -> Dict[str, np.ndarray]:
+    try:
+        return _extract_features(replay_path, num_historical_steps, native_fps)
+    except Exception as e:
+        print(f"[bw] skipping {replay_path.name}: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return {k: np.array([], dtype=np.float32) for k in _FEATURE_NAMES}
+
+
+def _collect_replays(
+    replays_dir: Path, splits: List[str], map_names: List[str] | None,
+) -> List[Path]:
+    files: List[Path] = []
+    for split in splits:
+        split_dir = replays_dir / split
+        if not split_dir.is_dir():
+            print(f"[bw] split dir missing, skipping: {split_dir}",
+                  file=sys.stderr)
+            continue
+        for map_dir in sorted(split_dir.iterdir()):
+            if not map_dir.is_dir():
                 continue
-            if scenario is None:
+            if map_names is not None and map_dir.name not in map_names:
                 continue
-            feats = _extract_gt_features(scenario)
-            for k, v in feats.items():
-                if v.size:
-                    buf[k].append(v.astype(np.float32))
-    return buf
-
-
-def _silverman(values: np.ndarray, n_kernel: int) -> float:
-    """Silverman's rule-of-thumb bandwidth for an `n_kernel`-sample KDE.
-
-    `bw = 1.06 * σ * n_kernel^{-1/5}`. σ comes from the pooled GT values (a
-    proxy for per-query feature spread); `n_kernel` is the number of samples
-    available to the KDE at eval time — i.e. R, the rollout count. The
-    dataset-wide sample count is *not* the right `n` here, because the KDE
-    is refit per (agent, timestep) from only R samples.
-    """
-    if values.size < 2 or n_kernel < 2:
-        return float("nan")
-    sigma = float(values.std())
-    if sigma == 0.0:
-        return float("nan")
-    return 1.06 * sigma * (n_kernel ** (-1.0 / 5.0))
+            files.extend(sorted(map_dir.glob("*.h5")))
+    return files
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rollouts_dir", type=Path, required=True)
-    parser.add_argument("--replays_dir", type=Path, required=True)
-    parser.add_argument("--observers", default="1,2")
-    parser.add_argument("--modes", default="own,opponent")
+    parser.add_argument("--replays_dir", type=Path, required=True,
+                        help="Replay root; layout {replays_dir}/{split}/{map}/{id}.h5")
+    parser.add_argument("--splits", default="test",
+                        help="Comma list of splits to scan (default: test)")
+    parser.add_argument("--map_names", default=None,
+                        help="Optional comma list to restrict to specific maps")
+    parser.add_argument("--num_historical_steps", type=int, default=17,
+                        help="Historical steps before the future window (default: 17)")
+    parser.add_argument("--native_fps", type=int, default=16,
+                        help="Frame rate (default: 16)")
     parser.add_argument("--n_workers", type=int, default=max(1, os.cpu_count() // 2))
     parser.add_argument("--max_scenarios", type=int, default=None,
-                        help="Optional cap on scenarios scanned, for a quick estimate.")
-    parser.add_argument("--n_rollouts", type=int, default=None,
-                        help="Rollout count to use as n in Silverman's formula. "
-                             "Defaults to the n_rollouts attr of the first scenario file.")
+                        help="Optional cap on scenarios, for a quick estimate.")
     args = parser.parse_args()
 
-    rollouts_dir = args.rollouts_dir.resolve()
     replays_dir = args.replays_dir.resolve()
-    if not rollouts_dir.is_dir():
-        raise SystemExit(f"--rollouts_dir not a directory: {rollouts_dir}")
     if not replays_dir.is_dir():
         raise SystemExit(f"--replays_dir not a directory: {replays_dir}")
 
-    observers = [int(x) for x in args.observers.split(",") if x.strip()]
-    modes = [x.strip() for x in args.modes.split(",") if x.strip()]
+    splits = [s.strip() for s in args.splits.split(",") if s.strip()]
+    map_names = None
+    if args.map_names:
+        map_names = [m.strip() for m in args.map_names.split(",") if m.strip()]
 
-    files = sorted(rollouts_dir.glob("*.h5"))
-    if args.max_scenarios is not None:
-        files = files[: args.max_scenarios]
+    files = _collect_replays(replays_dir, splits, map_names)
+    if args.max_scenarios is not None and args.max_scenarios < len(files):
+        # Deterministic shuffle so a small cap samples across all maps,
+        # not just the first in alphabetical order.
+        rng = np.random.default_rng(0)
+        files = [files[i] for i in rng.permutation(len(files))[: args.max_scenarios]]
     if not files:
-        raise SystemExit(f"No .h5 rollout files found under {rollouts_dir}")
-
-    # Pull n_rollouts from the first file so the default matches the data.
-    if args.n_rollouts is None:
-        import h5py
-        with h5py.File(files[0], "r") as f:
-            n_rollouts = int(f.attrs.get("n_rollouts", 0))
-        if n_rollouts < 2:
-            fallback = 8
-            print(
-                f"[bw] file reports n_rollouts={n_rollouts} (KDE ill-defined); "
-                f"falling back to n_kernel={fallback} for Silverman's rule. "
-                "Pass --n_rollouts explicitly to override."
-            )
-            n_rollouts = fallback
-    else:
-        n_rollouts = int(args.n_rollouts)
-    print(f"[bw] scanning {len(files)} scenarios, observers={observers}, "
-          f"modes={modes}, workers={args.n_workers}, n_rollouts={n_rollouts}")
+        raise SystemExit(
+            f"No replay .h5 files found under {replays_dir} "
+            f"(splits={splits}, maps={map_names})"
+        )
+    print(f"[bw] scanning {len(files)} replays  splits={splits}  "
+          f"maps={'all' if map_names is None else map_names}  "
+          f"workers={args.n_workers}")
 
     worker = partial(
-        _process_file, replays_dir=replays_dir,
-        observers=observers, modes=modes,
+        _worker,
+        num_historical_steps=args.num_historical_steps,
+        native_fps=args.native_fps,
     )
     if args.n_workers > 1:
         with mp.Pool(args.n_workers) as pool:
@@ -219,29 +200,30 @@ def main() -> None:
 
     pooled: Dict[str, List[np.ndarray]] = {k: [] for k in _FEATURE_NAMES}
     for d in per_file:
-        for k, lst in d.items():
-            pooled[k].extend(lst)
+        for k, v in d.items():
+            if v.size:
+                pooled[k].append(v)
 
-    print("\n=== Feature statistics (GT only) ===")
-    bandwidths: Dict[str, float] = {}
+    print("\n=== Feature statistics (GT only, teleport-gated) ===")
+    sigma_table: Dict[str, float] = {}
     for name in _FEATURE_NAMES:
         values = np.concatenate(pooled[name]) if pooled[name] else np.array([])
         if values.size == 0:
             print(f"  {name:28s}  n=0  (no valid samples)")
             continue
         sigma = float(values.std())
-        bw = _silverman(values, n_kernel=n_rollouts)
-        bandwidths[name] = bw
+        sigma_table[name] = sigma
         print(
             f"  {name:28s}  n={values.size:>10d}  σ={sigma:>9.4f}  "
-            f"min={values.min():>9.3f}  max={values.max():>9.3f}  "
-            f"bw_silverman={bw:>9.4f}"
+            f"min={values.min():>9.3f}  max={values.max():>9.3f}"
         )
 
-    if bandwidths:
-        flag_str = ",".join(f"{k}={v:.4f}" for k, v in bandwidths.items())
-        print("\n=== Suggested flag ===")
-        print(f"--kde_bandwidths {flag_str}")
+    if sigma_table:
+        print("\n=== Paste into src/starcraft/eval/feature_stats.py ===")
+        print("FEATURE_SIGMAS = {")
+        for k, v in sigma_table.items():
+            print(f'    "{k}": {v:.4f},')
+        print("}")
 
 
 if __name__ == "__main__":

@@ -253,17 +253,17 @@ def _make_scenario(N=2, R=3, T=8, fps=16, include_scene=False):
     )
 
 
-def test_kinematic_nll_emits_four_records():
+def test_kinematic_nll_emits_expected_records():
     from src.starcraft.eval.metrics import kinematic_nll
 
     scenario = _make_scenario()
     out = kinematic_nll.compute(scenario, ctx=None)
     names = {rec["metric"] for rec in out}
+    # angular_accel_nll intentionally dropped (SC2 units turn instantly).
     assert names == {
         "linear_speed_nll",
         "linear_accel_nll",
         "angular_speed_nll",
-        "angular_accel_nll",
     }
     for rec in out:
         assert rec["value"] is None or np.isfinite(rec["value"])
@@ -286,8 +286,10 @@ def test_kinematic_nll_matched_rollouts_low_nll():
     from src.starcraft.eval.metrics import kinematic_nll
 
     N, R, T, fps = 1, 4, 8, 16
-    # Straight-line trajectory so speed is constant.
-    base = np.stack([np.arange(T) * 2.0, np.zeros(T)], axis=-1).astype(np.float32)
+    # Straight-line trajectory so speed is constant. Use 0.1 cells/frame
+    # (= 1.6 cells/s) so we stay under the 10 cells/s teleport gate in
+    # kinematic_nll / kinematics.teleport_free_mask.
+    base = np.stack([np.arange(T) * 0.1, np.zeros(T)], axis=-1).astype(np.float32)
     pred = np.broadcast_to(base, (N, R, T, 2)).copy()
     gt = np.broadcast_to(base, (N, T, 2)).copy()
 
@@ -304,10 +306,22 @@ def test_kinematic_nll_matched_rollouts_low_nll():
         gt_radius=np.ones(N, dtype=np.float32),
         gt_is_flying=np.zeros((N, T), dtype=bool),
     )
-    out = {r["metric"]: r for r in kinematic_nll.compute(s, ctx=None)}
-    # linear_speed_nll with bw=0.5: log p = -log(0.5) - 0.5*log(2π) ≈ 0.0439
-    # so mean_nll ≈ -0.0439
+    # Pin bandwidth explicitly so the expected NLL is analytically known,
+    # independent of FEATURE_SIGMAS and Silverman's R-dependent shrinkage.
+    from src.starcraft.eval import metrics as metric_registry
     bw = 0.5
+    ctx = metric_registry.MetricCtx(
+        map_dir=None,
+        bandwidths={
+            "linear_speed_nll": bw,
+            "linear_accel_nll": bw,
+            "angular_speed_nll": bw,
+            "angular_accel_nll": bw,
+        },
+    )
+    out = {r["metric"]: r for r in kinematic_nll.compute(s, ctx=ctx)}
+    # Matched rollouts → GT lies on every KDE component's peak; density =
+    # single Gaussian peak density at σ=bw → mean_nll = log(bw) + 0.5·log(2π).
     expected_nll = -(-np.log(bw) - 0.5 * np.log(2.0 * np.pi))
     assert abs(out["linear_speed_nll"]["value"] - expected_nll) < 1e-4
 

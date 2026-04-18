@@ -10,6 +10,24 @@ from __future__ import annotations
 import numpy as np
 
 
+# Speed above this (cells/sec) is treated as a teleport — SC2 has several
+# legitimate teleport-like sources (dropship unload, burrow/unburrow,
+# warp-in, respawn). Ground units top out ~6 cells/s, so 10 cells/s keeps
+# real motion in while filtering the jumps. Matches the motion-dictionary
+# builder's `max_step_disp=5.0` per 8-frame stride (= 10 cells/s).
+MAX_SPEED_CELLS_PER_SEC = 10.0
+
+
+def teleport_free_mask(pos: np.ndarray, dt: float) -> np.ndarray:
+    """Per-(agent, t) mask flagging step t→t+1 as non-teleport.
+
+    `step_speed = ‖Δxy‖ / dt ≤ MAX_SPEED_CELLS_PER_SEC`.
+    pos: [..., T, 2]  →  [..., T-1] bool
+    """
+    step_disp = np.linalg.norm(np.diff(pos, axis=-2), axis=-1)
+    return (step_disp / dt) <= MAX_SPEED_CELLS_PER_SEC
+
+
 def wrap_angle_np(theta: np.ndarray) -> np.ndarray:
     """Wrap angles to [-pi, pi). The modulo form maps both +pi and -pi to -pi."""
     return (theta + np.pi) % (2.0 * np.pi) - np.pi

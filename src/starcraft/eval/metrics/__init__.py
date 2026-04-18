@@ -47,10 +47,7 @@ MODE_SENSITIVE_METRICS: frozenset = frozenset({
     "linear_speed_nll",
     "linear_accel_nll",
     "angular_speed_nll",
-    "angular_accel_nll",
     "distance_to_nearest_nll",
-    "collision_nll",
-    "collision_rate",
     "map_violation_nll",
     "map_violation_rate",
 })

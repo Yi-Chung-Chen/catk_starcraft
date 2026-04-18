@@ -17,22 +17,33 @@ from typing import Optional
 
 import numpy as np
 
+from src.starcraft.eval.feature_stats import default_bandwidth
 from src.starcraft.eval.kinematics import (
-    compute_angular_accel,
     compute_angular_speed,
     compute_linear_accel,
     compute_speed,
+    teleport_free_mask,
 )
 from src.starcraft.eval.load_rollout import ScenarioRollout
 from src.starcraft.eval.log_kde import log_kde
 
 
-_DEFAULT_BANDWIDTHS = {
-    "linear_speed_nll": 0.5,
-    "linear_accel_nll": 1.0,
-    "angular_speed_nll": 0.05,
-    "angular_accel_nll": 0.1,
-}
+# Angular acceleration was dropped on purpose: SC2 units can switch heading
+# instantly (no inertia), so Δω/dt doesn't constrain "realistic" motion —
+# the feature is dominated by arbitrary heading flips and mostly noise.
+_METRIC_NAMES = (
+    "linear_speed_nll",
+    "linear_accel_nll",
+    "angular_speed_nll",
+)
+
+
+def _resolve_bandwidth(metric: str, n_rollouts: int, ctx) -> float:
+    """Bandwidth precedence: explicit ctx override > Silverman from committed σ."""
+    if ctx is not None and getattr(ctx, "bandwidths", None):
+        if metric in ctx.bandwidths:
+            return float(ctx.bandwidths[metric])
+    return default_bandwidth(metric, n_rollouts)
 
 
 def _empty(name: str) -> dict:
@@ -67,9 +78,19 @@ def _reduce(
 
 
 def compute(scenario: ScenarioRollout, ctx: Optional[object] = None) -> list:
-    bandwidths = _DEFAULT_BANDWIDTHS.copy()
-    if ctx is not None and getattr(ctx, "bandwidths", None):
-        bandwidths.update(ctx.bandwidths)
+    # Derive R from the data, not the file attr — the save path opens in
+    # append mode and only stamps file-level attrs on first creation, so
+    # a rewrite with a different rollout count leaves the attr stale while
+    # pred_traj shape reflects the current run.
+    R = int(scenario.pred_traj.shape[1])
+    if R < 2:
+        # KDE is undefined with a single rollout sample; return empty records
+        # so the run doesn't crash on smoke-test rollouts.
+        return [
+            {"metric": name, "value": None, "n_agents": 0, "weight": 0}
+            for name in _METRIC_NAMES
+        ]
+    bandwidths = {name: _resolve_bandwidth(name, R, ctx) for name in _METRIC_NAMES}
 
     dt = 1.0 / float(scenario.native_fps)
     pred_traj = scenario.pred_traj.astype(np.float32)    # [N, R, T, 2]
@@ -81,19 +102,23 @@ def compute(scenario: ScenarioRollout, ctx: Optional[object] = None) -> list:
     # Kinematic features — shapes have one fewer T dim per derivative.
     pred_speed = compute_speed(pred_traj, dt)            # [N, R, T-1]
     gt_speed = compute_speed(gt_traj, dt)                # [N, T-1]
-    speed_valid = valid[:, 1:] & valid[:, :-1]           # [N, T-1]
+    # Teleport gate on GT only: rollouts don't teleport, and a GT step that
+    # contains a teleport corrupts the feature for that step regardless of
+    # how the rollouts predicted it. Gate symmetrically with the bandwidth
+    # estimator (see scripts/estimate_kde_bandwidths.py).
+    gt_no_tele = teleport_free_mask(gt_traj, dt)         # [N, T-1]
+    speed_valid = valid[:, 1:] & valid[:, :-1] & gt_no_tele
 
     pred_ang_speed = compute_angular_speed(pred_head, dt)  # [N, R, T-1]
     gt_ang_speed = compute_angular_speed(gt_head, dt)      # [N, T-1]
-    ang_speed_valid = speed_valid                           # same shape/logic
+    ang_speed_valid = speed_valid                           # share gate
 
     pred_accel = compute_linear_accel(pred_speed, dt)    # [N, R, T-2]
     gt_accel = compute_linear_accel(gt_speed, dt)        # [N, T-2]
-    accel_valid = valid[:, 2:] & valid[:, 1:-1] & valid[:, :-2]  # [N, T-2]
-
-    pred_ang_accel = compute_angular_accel(pred_ang_speed, dt)   # [N, R, T-2]
-    gt_ang_accel = compute_angular_accel(gt_ang_speed, dt)       # [N, T-2]
-    ang_accel_valid = accel_valid
+    accel_valid = (
+        valid[:, 2:] & valid[:, 1:-1] & valid[:, :-2]
+        & gt_no_tele[:, 1:] & gt_no_tele[:, :-1]
+    )
 
     out = [
         _reduce("linear_speed_nll", pred_speed, gt_speed, speed_valid,
@@ -102,7 +127,5 @@ def compute(scenario: ScenarioRollout, ctx: Optional[object] = None) -> list:
                 bandwidths["linear_accel_nll"]),
         _reduce("angular_speed_nll", pred_ang_speed, gt_ang_speed,
                 ang_speed_valid, bandwidths["angular_speed_nll"]),
-        _reduce("angular_accel_nll", pred_ang_accel, gt_ang_accel,
-                ang_accel_valid, bandwidths["angular_accel_nll"]),
     ]
     return out

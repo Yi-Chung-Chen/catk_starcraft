@@ -149,7 +149,7 @@ python \
   ckpt_path=$MY_CKPT_PATH \
   model.model_config.val_closed_loop=true \
   model.model_config.val_open_loop=false \
-  model.model_config.n_rollout_closed_val=1 \
+  model.model_config.n_rollout_closed_val=16 \
   model.model_config.n_vis_batch=2 \
   model.model_config.n_vis_scenario=2 \
   task_name=$MY_TASK_NAME \
