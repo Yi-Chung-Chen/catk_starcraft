@@ -4,7 +4,9 @@ Two-stage cross-attention via PyG MessagePassing:
   Stage 1 — K shared concept queries aggregate from all observer-visible units.
   Stage 2 — All non-neutral units attend to updated concepts (pos on Q).
 
-All position encodings use the observer's start location as reference.
+Position encodings use the observer's start location as origin and rotate
+into a per-scenario canonical frame whose +x axis points from the
+observer's start toward the opponent's start (canonical_heading).
 """
 
 from typing import Dict
@@ -15,6 +17,18 @@ from torch import Tensor
 
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.utils import weight_init
+
+
+def _rotate_into_canonical(
+    rel_world: Tensor,  # [..., 2]
+    theta: Tensor,      # broadcastable to rel_world[..., 0]
+) -> Tensor:
+    """Rotate world-frame offsets by −θ into the canonical frame whose
+    +x axis points from observer start toward opponent start."""
+    cos_t, sin_t = theta.cos(), theta.sin()
+    x =  cos_t * rel_world[..., 0] + sin_t * rel_world[..., 1]
+    y = -sin_t * rel_world[..., 0] + cos_t * rel_world[..., 1]
+    return torch.stack([x, y], dim=-1)
 
 
 class ConceptAttentionLayer(nn.Module):
@@ -111,6 +125,7 @@ class ConceptAttentionLayer(nn.Module):
         num_graphs: int,
         pos_a: Tensor,
         observer_start_loc: Tensor,
+        canonical_heading: Tensor,
         pos_emb: nn.Module,
     ) -> Dict[str, object]:
         """Build edges and positional encodings for observer-only concept attention.
@@ -126,6 +141,9 @@ class ConceptAttentionLayer(nn.Module):
             num_graphs: Batch size B.
             pos_a: [n_agent, n_step, 2] unit positions.
             observer_start_loc: [B, 2] observer's starting location.
+            canonical_heading: [B] atan2(opp_start − obs_start) — rotates the
+                (unit_pos − obs_start) world-frame offset into a per-scenario
+                canonical frame (+x toward opponent) before Fourier embedding.
             pos_emb: FourierEmbedding module for positional encoding.
 
         Returns:
@@ -154,11 +172,13 @@ class ConceptAttentionLayer(nn.Module):
 
         edge_index_s1 = torch.stack([src_1, dst_1])
 
-        # --- Stage 1 positional encoding: all relative to observer's start ---
+        # --- Stage 1 positional encoding: relative to observer's start,
+        # rotated into the per-scenario canonical frame ---
         pos_flat = pos_a.transpose(0, 1).reshape(n_step * n_agent, 2)  # step-major
         obs_start = observer_start_loc[batch[a1]]  # [n_vis, 2]
         unit_pos = pos_flat[unit_flat_1]  # [n_vis, 2]
-        rel = unit_pos - obs_start
+        rel_world = unit_pos - obs_start
+        rel = _rotate_into_canonical(rel_world, canonical_heading[batch[a1]])
         dist = rel.norm(dim=-1, keepdim=True)
         r_input = torch.cat([rel, dist], dim=-1)  # [n_vis, 3]
         r_s1 = pos_emb(
@@ -182,7 +202,9 @@ class ConceptAttentionLayer(nn.Module):
         if player_idx.numel() > 0:
             p_pos = pos_a[player_idx]  # [n_player, n_step, 2]
             p_s = observer_start_loc[batch[player_idx]]  # [n_player, 2]
-            p_rel = p_pos - p_s.unsqueeze(1)  # [n_player, n_step, 2]
+            p_rel_world = p_pos - p_s.unsqueeze(1)  # [n_player, n_step, 2]
+            p_theta = canonical_heading[batch[player_idx]].unsqueeze(-1)  # [n_player, 1]
+            p_rel = _rotate_into_canonical(p_rel_world, p_theta)
             p_dist = p_rel.norm(dim=-1, keepdim=True)
             p_feat = torch.cat([p_rel, p_dist], dim=-1)  # [n_player, n_step, 3]
             flat_idx = (

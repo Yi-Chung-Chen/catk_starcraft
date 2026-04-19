@@ -507,6 +507,7 @@ class SCAgentDecoder(nn.Module):
                 num_graphs=num_graphs,
                 pos_a=pos_a,
                 observer_start_loc=tokenized_agent["observer_start_loc"],
+                canonical_heading=tokenized_agent["canonical_heading"],
                 pos_emb=self.concept_pos_emb,
             )
 
@@ -731,6 +732,7 @@ class SCAgentDecoder(nn.Module):
                     num_graphs=tokenized_agent["num_graphs"],
                     pos_a=pos_a[:, -hist_step:],
                     observer_start_loc=tokenized_agent["observer_start_loc"],
+                    canonical_heading=tokenized_agent["canonical_heading"],
                     pos_emb=self.concept_pos_emb,
                 )
 

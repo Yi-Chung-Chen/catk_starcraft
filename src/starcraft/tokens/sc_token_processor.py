@@ -60,6 +60,7 @@ _SHARED_KEYS = frozenset({
     "num_graphs", "token_traj_all", "token_traj", "trajectory_token",
     "player_start_loc",
     "observer_start_loc",  # only present after filter_agents_for_perspective
+    "canonical_heading",   # only present after filter_agents_for_perspective
 })
 
 
@@ -152,9 +153,18 @@ def filter_agents_for_perspective(
     # --- is_observer flag for intent gating ---
     is_observer = out["owner"] == observer_player
 
-    # --- Observer start location for concept attention ---
+    # --- Observer start location + canonical frame heading for concept attention ---
+    # canonical_heading defines the per-scenario frame whose +x axis points from
+    # the observer's start toward the opponent's start. concept_attention rotates
+    # (unit_pos − obs_start) by −canonical_heading to restore rotational
+    # equivariance at the scenario-global scope.
     obs_start_idx = 0 if observer_player == 1 else 1
-    out["observer_start_loc"] = out["player_start_loc"][:, obs_start_idx]  # [B, 2]
+    opp_start_idx = 1 - obs_start_idx
+    obs_start = out["player_start_loc"][:, obs_start_idx]  # [B, 2]
+    opp_start = out["player_start_loc"][:, opp_start_idx]  # [B, 2]
+    out["observer_start_loc"] = obs_start
+    delta = opp_start - obs_start  # [B, 2]
+    out["canonical_heading"] = torch.atan2(delta[:, 1], delta[:, 0])  # [B]
     out["is_observer"] = is_observer
 
     # --- Zero out intent for non-observer (opponent + neutral) units ---
