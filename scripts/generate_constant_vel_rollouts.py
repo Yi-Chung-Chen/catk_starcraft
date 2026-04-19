@@ -20,9 +20,16 @@ Shorthand `maps=<token>` is translated at argv level to the matching
     - `maps=all`  → no filter (uses the data config's default)
     - `maps=Foo,Bar` → custom comma list (with quoting for parens if needed)
 
+Noise (Waymo sim-agents style, per-step action noise on velocity / heading):
+    +noise_vel_sigma=<σ_v>   per-axis velocity noise std, cells/frame (default 0.0)
+    +noise_head_sigma=<σ_h>  heading noise std, radians/frame  (default 0.0)
+    The `+` prefix is required — these are new Hydra config keys.
+    Recommended first setting: `+noise_vel_sigma=0.06`.
+
 Example:
-    python scripts/generate_constant_vel_rollouts.py           # id maps, default task_name
-    python scripts/generate_constant_vel_rollouts.py maps=ood  # held-out maps
+    python scripts/generate_constant_vel_rollouts.py                         # deterministic CV
+    python scripts/generate_constant_vel_rollouts.py maps=ood                # held-out maps
+    python scripts/generate_constant_vel_rollouts.py +noise_vel_sigma=0.06   # stochastic, non-degenerate NLL
 
 Output: `${hydra.runtime.output_dir}/rollouts/{scenario_id}.h5` — one file
 per scenario, four groups (`obs_p{1,2}/{own,opponent}`).
@@ -50,13 +57,34 @@ if not any(
 ):
     sys.argv.insert(1, "experiment=sc_pre_bc")
 
+def _noise_sigma_from_argv(key: str) -> float:
+    """Argv-level scan for a sigma override of the form
+    `+<key>=<float>` or `<key>=<float>`. Returns 0.0 if absent or malformed."""
+    for a in sys.argv[1:]:
+        if a.startswith(f"+{key}=") or a.startswith(f"{key}="):
+            try:
+                return float(a.split("=", 1)[1])
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
 # Default the output dir name so logs/ stays organized — this script only
-# generates the one (constant_velocity) baseline method.
+# generates the one (constant_velocity) baseline method. If either sigma
+# is nonzero, use a distinct task_name so noise/no-noise runs don't clobber.
 if not any(
     a.startswith("task_name=") or a.startswith("+task_name=")
     for a in sys.argv[1:]
 ):
-    sys.argv.insert(1, "task_name=sc_closed_test_constant_velocity")
+    _has_noise = (
+        _noise_sigma_from_argv("noise_vel_sigma") > 0
+        or _noise_sigma_from_argv("noise_head_sigma") > 0
+    )
+    _default_task_name = (
+        "sc_closed_test_constant_velocity_noise" if _has_noise
+        else "sc_closed_test_constant_velocity"
+    )
+    sys.argv.insert(1, f"task_name={_default_task_name}")
 
 # Translate `maps=<token>` shortcuts to the full `data.test_map_names=[...]`
 # Hydra override, mirroring `scripts/local_test_sc.sh`. Default to `id` when
@@ -111,17 +139,35 @@ _NUM_FUTURE_STEPS = 128
 _NATIVE_FPS = 16
 
 
-def _build_constant_velocity_rollout(data) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute [N_total, 1, 128, 2] pred_traj and [N_total, 1, 128] pred_head
-    from raw native-rate GT history.
+def _build_rollout(
+    data,
+    n_rollouts: int,
+    noise_vel_sigma: float,
+    noise_head_sigma: float,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute `[N, R, 128, 2]` `pred_traj` and `[N, R, 128]` `pred_head` from
+    raw native-rate GT history.
 
-    Velocity is `pos[:, 16] - pos[:, 15]`, per native frame. Falls back to
-    zero velocity (hold position) when either frame 15 or frame 16 is
-    invalid, so dead/late-spawned units extrapolate sensibly.
+    Base velocity `v = pos[:, 16] - pos[:, 15]`, zero when either frame is
+    invalid (hold position for dead / late-spawned units).
+
+    When both sigmas are zero, takes a deterministic fast path — the R
+    replicas are byte-identical copies of a single CV trajectory (matching
+    the pre-noise behavior exactly).
+
+    When either sigma > 0, uses Waymo's per-step action-noise form:
+        state[r, k+1] = state[r, k] + v + eps_v[r, k]   eps_v ~ N(0, σ_v²)
+        head [r, k+1] = head [r, k]       + eps_h[r, k] eps_h ~ N(0, σ_h²)
+    Each replica is a random walk on velocity / heading, so positional and
+    angular variance grow with horizon — non-degenerate for NLL metrics.
     """
     pos = data["agent"]["position"][..., :2]  # [N, 145, 2]
     valid = data["agent"]["valid_mask"]        # [N, 145]
     heading = data["agent"]["heading"]         # [N, 145]
+    N = pos.shape[0]
+    R = n_rollouts
+    K = _NUM_FUTURE_STEPS
 
     t_now = _NUM_HISTORICAL_STEPS - 1   # = 16
     t_prev = t_now - 1                  # = 15
@@ -133,15 +179,38 @@ def _build_constant_velocity_rollout(data) -> tuple[torch.Tensor, torch.Tensor]:
         torch.zeros_like(pos[:, t_now]),
     )  # [N, 2]
 
-    # Future frames are t_now+1 .. t_now+128. Step index k ∈ [0, 128),
-    # displacement is (k+1) * vel.
-    k = torch.arange(
-        1, _NUM_FUTURE_STEPS + 1, device=pos.device, dtype=pos.dtype
-    ).view(1, _NUM_FUTURE_STEPS, 1)
-    pred_pos = pos[:, t_now].unsqueeze(1) + k * vel.unsqueeze(1)  # [N, 128, 2]
-    pred_head = heading[:, t_now].unsqueeze(-1).expand(-1, _NUM_FUTURE_STEPS)  # [N, 128]
+    if noise_vel_sigma == 0 and noise_head_sigma == 0:
+        # Deterministic fast path — preserves byte-for-byte output vs. the
+        # pre-noise implementation.
+        k_idx = torch.arange(
+            1, K + 1, device=pos.device, dtype=pos.dtype
+        ).view(1, K, 1)
+        pred_pos = pos[:, t_now].unsqueeze(1) + k_idx * vel.unsqueeze(1)  # [N, K, 2]
+        pred_head = heading[:, t_now].unsqueeze(-1).expand(-1, K)         # [N, K]
+        pred_traj = pred_pos.unsqueeze(1).expand(-1, R, -1, -1).contiguous()
+        pred_head = pred_head.unsqueeze(1).expand(-1, R, -1).contiguous()
+        return pred_traj, pred_head
 
-    return pred_pos.unsqueeze(1), pred_head.unsqueeze(1)  # add rollout axis (R=1)
+    # Noisy path: per-step velocity/heading action noise, integrated by
+    # cumulative sum (vectorized random walk).
+    if noise_vel_sigma > 0:
+        eps_v = torch.randn(N, R, K, 2, generator=generator) * noise_vel_sigma
+    else:
+        eps_v = torch.zeros(N, R, K, 2)
+    v_eff = vel.view(N, 1, 1, 2) + eps_v                        # [N, R, K, 2]
+    displacement = v_eff.cumsum(dim=2)                           # [N, R, K, 2]
+    pred_traj = pos[:, t_now].view(N, 1, 1, 2) + displacement    # [N, R, K, 2]
+
+    if noise_head_sigma > 0:
+        eps_h = torch.randn(N, R, K, generator=generator) * noise_head_sigma
+        head_displacement = eps_h.cumsum(dim=2)                  # [N, R, K]
+        pred_head = heading[:, t_now].view(N, 1, 1) + head_displacement
+    else:
+        pred_head = (
+            heading[:, t_now].view(N, 1, 1).expand(N, R, K).contiguous()
+        )
+
+    return pred_traj, pred_head
 
 
 @hydra.main(config_path="../configs/", config_name="run.yaml", version_base=None)
@@ -182,13 +251,29 @@ def main(cfg: DictConfig) -> None:
             "`model.model_config.n_rollout_closed_val=16`."
         )
 
+    # Noise parameters (new keys; users pass via `+noise_vel_sigma=...` at CLI).
+    # OmegaConf.select tolerates missing keys and the `+`-prefix add form.
+    noise_vel_sigma = float(OmegaConf.select(cfg, "noise_vel_sigma", default=0.0))
+    noise_head_sigma = float(OmegaConf.select(cfg, "noise_head_sigma", default=0.0))
+
+    # Seeded CPU generator for reproducibility — same seed + same sigmas →
+    # byte-identical output. cfg.seed is plumbed via configs/run.yaml:29.
+    noise_generator = torch.Generator()
+    noise_generator.manual_seed(int(cfg.seed))
+
     # Match SCSMART's file_attrs schema so load_rollout / offline harness
     # treat baseline files indistinguishably from model files.
     dataset_version = Path(cfg.data.dataset_root).name
-    # A hash of "constant_velocity" makes the hash-field populated (keeps
-    # downstream CSVs from special-casing an empty field), while the
-    # string itself doesn't pretend to be a real model fingerprint.
-    model_config_hash = hashlib.sha256(b"constant_velocity").hexdigest()[:16]
+    # Keep the deterministic hash stable when no noise is configured, so the
+    # σ=0 output remains byte-identical to the pre-noise implementation.
+    if noise_vel_sigma == 0 and noise_head_sigma == 0:
+        hash_input = "constant_velocity"
+    else:
+        hash_input = (
+            "constant_velocity_step_noise"
+            f"|vel_sigma={noise_vel_sigma}|head_sigma={noise_head_sigma}"
+        )
+    model_config_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
     file_attrs = {
         "num_historical_steps": _NUM_HISTORICAL_STEPS,
         "num_future_steps": _NUM_FUTURE_STEPS,
@@ -206,17 +291,15 @@ def main(cfg: DictConfig) -> None:
     print(
         f"[constant_vel] dataset={dataset_version} "
         f"maps={list(cfg.data.test_map_names) if cfg.data.test_map_names else 'all'} "
-        f"n_rollouts={n_rollouts} save_dir={save_dir}"
+        f"n_rollouts={n_rollouts} "
+        f"noise_vel_sigma={noise_vel_sigma} noise_head_sigma={noise_head_sigma} "
+        f"save_dir={save_dir}"
     )
 
     for data in tqdm(dataloader, desc="generate", unit="batch"):
-        pred_traj_all, pred_head_all = _build_constant_velocity_rollout(data)
-        # Replicate the deterministic rollout across R samples (see
-        # n_rollouts comment above). .expand is a zero-copy view;
-        # .contiguous() materializes so downstream `.numpy()` in the saver
-        # sees a normal-stride tensor.
-        pred_traj_all = pred_traj_all.expand(-1, n_rollouts, -1, -1).contiguous()
-        pred_head_all = pred_head_all.expand(-1, n_rollouts, -1).contiguous()
+        pred_traj_all, pred_head_all = _build_rollout(
+            data, n_rollouts, noise_vel_sigma, noise_head_sigma, noise_generator,
+        )
 
         tokenized_agent = token_processor.tokenize_agent(data)
         train_mask = data["agent"]["train_mask"]
