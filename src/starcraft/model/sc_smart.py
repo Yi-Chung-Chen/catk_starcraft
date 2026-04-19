@@ -289,26 +289,24 @@ class SCSMART(LightningModule):
                     "Valid options: 'own', 'opponent'."
                 )
 
-            pred_traj_list = []
-            pred_head_list = []
+            # Single batched call: R rollout replicas are stitched as disjoint
+            # graphs inside SCDecoder.inference and returned with a rollout
+            # dimension so downstream code sees the same shapes as the old
+            # per-rollout loop.
+            pred = self.encoder.inference(
+                tokenized_map, filt_e, self.validation_rollout_sampling,
+                teacher_force_mask=teacher_force_mask,
+                visibility_gate=vis_to_obs,
+                n_rollouts=self.n_rollout_closed_val,
+            )
+            pred_traj = pred["pred_traj_native"]  # [n_filt, n_rollout, n_step, 2]
+            pred_head = pred["pred_head_native"]  # [n_filt, n_rollout, n_step]
             aux_target_list = []
-            for _ in range(self.n_rollout_closed_val):
-                pred = self.encoder.inference(
-                    tokenized_map, filt_e, self.validation_rollout_sampling,
-                    teacher_force_mask=teacher_force_mask,
-                    visibility_gate=vis_to_obs,
-                )
-                pred_traj_list.append(pred["pred_traj_native"])
-                pred_head_list.append(pred["pred_head_native"])
-                if self.use_aux_loss:
-                    aux_target_list.append({k: pred[k] for k in _AUX_KEYS})
-
-            pred_traj = torch.stack(
-                pred_traj_list, dim=1
-            )  # [n_filtered, n_rollout, n_step, 2]
-            pred_head = torch.stack(
-                pred_head_list, dim=1
-            )  # [n_filtered, n_rollout, n_step]
+            if self.use_aux_loss:
+                R = self.n_rollout_closed_val
+                aux_target_list = [
+                    {k: pred[k][:, r] for k in _AUX_KEYS} for r in range(R)
+                ]
 
             # Overlay native-fps GT onto teacher-forced rows so the teacher-forced
             # side is pixel-exact (the in-decoder override is only 2Hz-accurate).

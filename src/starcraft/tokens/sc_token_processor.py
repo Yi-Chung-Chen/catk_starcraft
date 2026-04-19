@@ -58,6 +58,11 @@ _AGENT_DIM0_KEYS = frozenset({
 # Keys shared across all agents (vocab tensors, scalars) — passed through unfiltered.
 _SHARED_KEYS = frozenset({
     "num_graphs", "token_traj_all", "token_traj", "trajectory_token",
+})
+# Keys with leading dim == num_graphs. Pass through perspective filtering
+# unchanged (same as _SHARED_KEYS), but must be replicated when rollouts are
+# batched as disjoint graphs in SCDecoder.inference.
+_PER_SCENARIO_KEYS = frozenset({
     "player_start_loc",
     "observer_start_loc",  # only present after filter_agents_for_perspective
     "canonical_heading",   # only present after filter_agents_for_perspective
@@ -137,14 +142,15 @@ def filter_agents_for_perspective(
     # --- Filter all per-agent tensors ---
     out: Dict[str, Tensor] = {}
     for k, v in tokenized_agent.items():
-        if k in _SHARED_KEYS:
+        if k in _SHARED_KEYS or k in _PER_SCENARIO_KEYS:
             out[k] = v
         elif k in _AGENT_DIM0_KEYS:
             out[k] = v[keep_mask]
         else:
             raise ValueError(
-                f"Unknown tokenized_agent key '{k}' — "
-                "add to _AGENT_DIM0_KEYS or _SHARED_KEYS in sc_token_processor.py"
+                f"Unknown tokenized_agent key '{k}' — add to "
+                "_AGENT_DIM0_KEYS, _PER_SCENARIO_KEYS, or _SHARED_KEYS "
+                "in sc_token_processor.py"
             )
 
     # --- Remap owner_idx: 0=observer, 1=opponent, 2=neutral ---

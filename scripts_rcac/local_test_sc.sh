@@ -1,26 +1,22 @@
 #!/bin/bash
-# Usage: bash scripts/local_test_sc.sh <ckpt> [variant] [dataset] [maps] [save_rollouts]
+# Usage: sbatch scripts_rcac/run.sbatch local_test_sc.sh <ckpt> [variant] [dataset] [maps] [save_rollouts]
 #   ckpt:           path to .ckpt file OR run directory (appends /checkpoints/last.ckpt)
 #   variant:        smart (default), hmart, hmart_aux, hmart_c8, hmart_c32,
 #                   hmart_intent, hmart_intent_aux, smart_intent_aux,
 #                   hmart_c4_intent_aux, hmart_c8_intent_aux
 #   dataset:        adv (default), unbias
-#   maps:           id (default; 5 train/val maps: Abyssal_Reef_LE, Acolyte_LE,
-#                       Ascension_to_Aiur_LE, Interloper_LE, Mech_Depot_LE),
-#                   ood (held-out maps: Catallena_LE_(Void), Odyssey_LE),
-#                   all (use config's test_map_names — null = every map in test split),
-#                   custom comma list (e.g. "Catallena_LE_(Void),Odyssey_LE")
-#   save_rollouts:  yes (default for test runs), no
+#   maps:           id (default; 5 id maps), ood (2 held-out maps), all,
+#                   or custom comma list
+#   save_rollouts:  yes (default), no
 #
-# Example:
-#   bash scripts/local_test_sc.sh logs/.../last.ckpt smart adv id  yes
-#   bash scripts/local_test_sc.sh logs/.../last.ckpt smart adv ood yes
+# Rollout GIFs are disabled here (n_vis_batch=0) — visualize offline from the
+# saved rollout HDF5s instead.
 
 set -e
 
 if [ -z "$1" ]; then
   echo "Error: missing checkpoint argument"
-  echo "Usage: bash scripts/local_test_sc.sh <ckpt> [variant] [dataset] [maps] [save_rollouts]"
+  echo "Usage: sbatch scripts_rcac/run.sbatch local_test_sc.sh <ckpt> [variant] [dataset] [maps] [save_rollouts]"
   exit 1
 fi
 
@@ -48,20 +44,12 @@ fi
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
-# Test runs are save-and-go: no live iteration, no metric dashboarding.
-# All numbers come from the offline harness (scripts/eval_sc_rollouts.py).
-# Override with WANDB_MODE=online if you ever want the two test_closed/* scalars.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Test runs are save-and-go; offline harness reads the saved rollouts.
 export WANDB_MODE=${WANDB_MODE:-disabled}
 
 MY_EXPERIMENT="sc_pre_bc"
-MY_TASK_NAME="sc_closed_test_${VARIANT}"
-
-# --- GPU count auto-detection ---
-# Override with `NUM_GPUS=1 bash scripts/local_test_sc.sh ...` to force
-# single-GPU on a multi-GPU box (useful for debugging).
-NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}
-NUM_GPUS=${NUM_GPUS:-1}
-if [ "$NUM_GPUS" -lt 1 ]; then NUM_GPUS=1; fi
+MY_TASK_NAME="sc_closed_test_${VARIANT}-rcac"
 
 # --- Dataset ---
 if [ "$DATASET" = "unbias" ]; then
@@ -71,9 +59,6 @@ else
 fi
 
 # --- Map filter ---
-# Note on Catallena_LE_(Void): the map_name contains parentheses, which Hydra
-# requires to be inside a quoted string element. Single-quote the element
-# inside the bash double-quoted value.
 case "$MAPS" in
   id)
     MAP_OVERRIDE='data.test_map_names=[Abyssal_Reef_LE,Acolyte_LE,Ascension_to_Aiur_LE,Interloper_LE,Mech_Depot_LE]'
@@ -85,8 +70,6 @@ case "$MAPS" in
     MAP_OVERRIDE=""
     ;;
   *)
-    # Custom comma-list. Hydra needs the list literal form. If a map name
-    # contains parens or other special chars, quote it: "'Foo_(Bar)',Baz".
     MAP_OVERRIDE="data.test_map_names=[${MAPS}]"
     ;;
 esac
@@ -133,47 +116,57 @@ if [ "$SAVE_ROLLOUTS" = "yes" ]; then
   SAVE_OVERRIDE="model.model_config.save_closed_rollouts=true"
 fi
 
-if [ "$CONDA_DEFAULT_ENV" != "catk" ]; then
-  echo "Error: catk conda env not active. Run 'conda activate catk' first."
-  exit 1
-fi
-
-echo "=== local_test_sc.sh | variant=$VARIANT | dataset=$DATASET | maps=$MAPS | save=$SAVE_ROLLOUTS ==="
+echo "=== scripts_rcac/local_test_sc.sh | variant=$VARIANT | dataset=$DATASET | maps=$MAPS | save=$SAVE_ROLLOUTS ==="
 echo "    ckpt: $MY_CKPT_PATH"
 
-# Closed-loop test. action=test runs trainer.test() which dispatches to
-# SCSMART.test_step (aliased to _shared_eval_step(stage='test')).
-# val_open_loop=false: skip token-cls; we only want the rollouts.
-# val_closed_loop=true: enable closed-loop rollouts (the one we save).
-# Launcher auto-adapts: 1 GPU → python + trainer=default; 2+ GPUs →
-# torchrun + trainer=ddp. Rollout save handles DDP via rank{N}.h5 suffixes;
-# GIFs only on rank 0.
-if [ "$NUM_GPUS" -ge 2 ]; then
-  echo "    launcher: torchrun on $NUM_GPUS GPUs (DDP)"
-  LAUNCH=(torchrun --standalone --nproc_per_node "$NUM_GPUS")
-  TRAINER_CFG=(trainer=ddp "trainer.devices=$NUM_GPUS")
+# --- Launcher: torchrun+DDP on multi-GPU SLURM allocations, python on 1 GPU ---
+NGPUS=${SLURM_GPUS_ON_NODE:-1}
+
+if [ "$NGPUS" -gt 1 ]; then
+  echo "    launcher: torchrun on $NGPUS GPUs (DDP, SLURM rendezvous)"
+  torchrun \
+    --rdzv_id ${SLURM_JOB_ID:-0} \
+    --rdzv_backend c10d \
+    --rdzv_endpoint ${MASTER_ADDR:-localhost}:${MASTER_PORT:-29500} \
+    --nnodes ${SLURM_NNODES:-1} \
+    --nproc_per_node $NGPUS \
+    -m src.run \
+    action=test \
+    experiment=$MY_EXPERIMENT \
+    trainer=ddp \
+    trainer.accelerator=gpu \
+    trainer.devices=$NGPUS \
+    ckpt_path=$MY_CKPT_PATH \
+    model.model_config.val_closed_loop=true \
+    model.model_config.val_open_loop=false \
+    model.model_config.n_rollout_closed_val=16 \
+    model.model_config.n_vis_batch=0 \
+    model.model_config.n_vis_scenario=2 \
+    task_name=$MY_TASK_NAME \
+    $DATA_OVERRIDES \
+    $MAP_OVERRIDE \
+    $MODEL_OVERRIDES \
+    $SAVE_OVERRIDE
 else
   echo "    launcher: python on 1 GPU"
-  LAUNCH=(python)
-  TRAINER_CFG=(trainer=default trainer.devices=1 trainer.strategy=auto)
+  python -m src.run \
+    action=test \
+    experiment=$MY_EXPERIMENT \
+    trainer=default \
+    trainer.accelerator=gpu \
+    trainer.devices=1 \
+    trainer.strategy=auto \
+    ckpt_path=$MY_CKPT_PATH \
+    model.model_config.val_closed_loop=true \
+    model.model_config.val_open_loop=false \
+    model.model_config.n_rollout_closed_val=16 \
+    model.model_config.n_vis_batch=0 \
+    model.model_config.n_vis_scenario=2 \
+    task_name=$MY_TASK_NAME \
+    $DATA_OVERRIDES \
+    $MAP_OVERRIDE \
+    $MODEL_OVERRIDES \
+    $SAVE_OVERRIDE
 fi
 
-"${LAUNCH[@]}" \
-  -m src.run \
-  action=test \
-  experiment=$MY_EXPERIMENT \
-  "${TRAINER_CFG[@]}" \
-  trainer.accelerator=gpu \
-  ckpt_path=$MY_CKPT_PATH \
-  model.model_config.val_closed_loop=true \
-  model.model_config.val_open_loop=false \
-  model.model_config.n_rollout_closed_val=16 \
-  model.model_config.n_vis_batch=0 \
-  model.model_config.n_vis_scenario=2 \
-  task_name=$MY_TASK_NAME \
-  $DATA_OVERRIDES \
-  $MAP_OVERRIDE \
-  $MODEL_OVERRIDES \
-  $SAVE_OVERRIDE
-
-echo "bash local_test_sc.sh done!"
+echo "scripts_rcac/local_test_sc.sh done!"
