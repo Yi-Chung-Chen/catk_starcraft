@@ -376,6 +376,12 @@ class SCSMART(LightningModule):
                 )
                 full_pred_traj[keep_mask_e] = pred_traj
 
+                full_pred_head = torch.zeros(
+                    N_total, *pred_head.shape[1:],
+                    dtype=pred_head.dtype, device=pred_head.device,
+                )
+                full_pred_head[keep_mask_e] = pred_head
+
                 # Units of interest for this (observer, mode): the same
                 # metric_scope rows the rollout I/O saves. Scattered back
                 # onto the full N_total roster so extract_scenario_data can
@@ -409,6 +415,7 @@ class SCSMART(LightningModule):
                             pred_valid_mask=keep_mask_e,
                             observer_player=observer_player,
                             target_mask=target_mask_full,
+                            pred_head=full_pred_head,
                         )
                         save_dir = (
                             self.gif_dir

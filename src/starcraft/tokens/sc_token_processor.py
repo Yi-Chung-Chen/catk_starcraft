@@ -15,7 +15,7 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
-from src.smart.utils import cal_circular_contour, transform_to_global, transform_to_local, wrap_angle
+from src.smart.utils import cal_circular_contour, transform_to_global, transform_to_local
 from src.starcraft.utils.coarse_action_mapping import ABILITY_ID_TO_COARSE_ACTION
 
 _PADDED_SIZE = 200  # all maps padded to 200x200
@@ -348,8 +348,12 @@ class SCTokenProcessor(torch.nn.Module):
         heading = data["agent"]["heading"].clone()  # [n_agent, T]
         pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, T, 2]
 
-        # Clean heading discontinuities
-        heading = self._clean_heading(valid, heading)
+        # Do NOT run _clean_heading here: its >1.5 rad discontinuity filter is a
+        # Waymo-vehicle assumption that SC units violate routinely (snap-turns
+        # on retarget, workers pivoting between mine and hatchery, air units).
+        # Simulator-authored headings are already noise-free, so the cleaner
+        # would only erase real rotations — catastrophic once rel_target_pos
+        # below is expressed in the heading-local frame.
 
         # Stationary-fill extrapolation (no velocity needed)
         valid, pos, heading = self._extrapolate_stationary(valid, pos, heading)
@@ -390,7 +394,15 @@ class SCTokenProcessor(torch.nn.Module):
         tokenized_agent["coarse_action"] = _vectorized_coarse_action(ability_steps)  # [n_agent, 18] 0-10
         tokenized_agent["has_action"] = (ability_steps != 0)  # [n_agent, 18]
         tokenized_agent["has_target_pos"] = (target_steps.abs().sum(-1) > 0)  # [n_agent, 18]
-        rel_target = (target_steps - unit_pos_steps) / _TARGET_POS_NORM  # [n_agent, 18, 2]
+        # Express the target offset in each boundary's heading-local frame so the
+        # aux head predicts in the same rotationally-equivariant frame the
+        # backbone's edge features already live in.
+        head_steps = heading[:, self.shift :: self.shift]  # [n_agent, 18]
+        delta = target_steps - unit_pos_steps               # [n_agent, 18, 2]
+        cos_h, sin_h = head_steps.cos(), head_steps.sin()
+        rel_x =  cos_h * delta[..., 0] + sin_h * delta[..., 1]
+        rel_y = -sin_h * delta[..., 0] + cos_h * delta[..., 1]
+        rel_target = torch.stack([rel_x, rel_y], dim=-1) / _TARGET_POS_NORM
         rel_target[~tokenized_agent["has_target_pos"]] = 0.0
         tokenized_agent["rel_target_pos"] = rel_target  # [n_agent, 18, 2]
 
@@ -544,13 +556,3 @@ class SCTokenProcessor(torch.nn.Module):
         idx[owner == 2] = 1
         idx[owner == 16] = 2
         return idx
-
-    @staticmethod
-    def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
-        """Fix heading discontinuities (>1.5 rad jumps)."""
-        valid_pairs = valid[:, :-1] & valid[:, 1:]
-        for i in range(heading.shape[1] - 1):
-            heading_diff = torch.abs(wrap_angle(heading[:, i] - heading[:, i + 1]))
-            change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
-            heading[:, i + 1][change_needed] = heading[:, i][change_needed]
-        return heading

@@ -18,7 +18,8 @@ FPS = 16  # native frame rate
 def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
                           num_historical_steps=17, aux_target_data=None,
                           map_data_dir=None, pred_valid_mask=None,
-                          observer_player=None, target_mask=None):
+                          observer_player=None, target_mask=None,
+                          pred_head=None):
     """Extract per-scenario numpy arrays from batched PyG data.
 
     Args:
@@ -61,8 +62,12 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
 
     out = {
         "gt_positions": data["agent"]["position"][mask, :, :2].cpu().numpy(),
+        "gt_headings": data["agent"]["heading"][mask].cpu().numpy(),
         "gt_valid": valid.cpu().numpy(),
         "pred_positions": pred_traj[mask, rollout_idx].cpu().numpy(),
+        "pred_headings": (
+            pred_head[mask, rollout_idx].cpu().numpy() if pred_head is not None else None
+        ),
         "pred_agent_mask": pred_agent_mask,
         "owner": data["agent"]["owner"][mask].cpu().numpy(),
         "scenario_id": data["scenario_id"][scenario_idx],
@@ -100,10 +105,21 @@ def extract_scenario_data(data, pred_traj, scenario_idx, rollout_idx,
 _TARGET_POS_NORM = 200.0
 
 
+def _local_to_world_offset(local_xy, head):
+    """Rotate a single 2-D local-frame offset into world coords by +head."""
+    cos_h, sin_h = np.cos(head), np.sin(head)
+    return np.array([
+        cos_h * local_xy[0] - sin_h * local_xy[1],
+        sin_h * local_xy[0] + cos_h * local_xy[1],
+    ])
+
+
 def save_scenario_gif(
     gt_positions,
+    gt_headings,
     gt_valid,
     pred_positions,
+    pred_headings,
     pred_agent_mask,
     owner,
     scenario_id,
@@ -319,7 +335,10 @@ def save_scenario_gif(
                 for u, gl in gt_target_lines:
                     if gt_valid[u, frame_idx] and gt_has_target[u, step_2hz]:
                         anchor = gt_positions[u, boundary_frame]
-                        tgt = anchor + gt_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        local_offset = gt_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        tgt = anchor + _local_to_world_offset(
+                            local_offset, gt_headings[u, boundary_frame]
+                        )
                         gl.set_data([gt_positions[u, frame_idx, 0], tgt[0]],
                                     [gt_positions[u, frame_idx, 1], tgt[1]])
                         gt_tgt_pts.append(tgt)
@@ -328,7 +347,10 @@ def save_scenario_gif(
                 for u, pl in pred_target_lines:
                     if gt_valid[u, frame_idx] and pred_has_target[u, step_2hz]:
                         anchor = pred_positions[u, boundary_pred_idx]
-                        tgt = anchor + pred_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        local_offset = pred_target_rel[u, step_2hz] * _TARGET_POS_NORM
+                        tgt = anchor + _local_to_world_offset(
+                            local_offset, pred_headings[u, boundary_pred_idx]
+                        )
                         pl.set_data([pred_positions[u, pred_idx, 0], tgt[0]],
                                     [pred_positions[u, pred_idx, 1], tgt[1]])
                         pred_tgt_pts.append(tgt)
