@@ -26,6 +26,8 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List
 
+from tqdm import tqdm
+
 # Ensure repo root is importable when invoked as a plain script
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -150,9 +152,17 @@ def main() -> None:
 
     if args.n_workers > 1:
         with mp.Pool(args.n_workers) as pool:
-            per_scenario = pool.map(process_fn, rollout_files)
+            per_scenario = list(tqdm(
+                pool.imap_unordered(process_fn, rollout_files, chunksize=8),
+                total=len(rollout_files),
+                desc="eval",
+                unit="scn",
+            ))
     else:
-        per_scenario = [process_fn(p) for p in rollout_files]
+        per_scenario = [
+            process_fn(p)
+            for p in tqdm(rollout_files, desc="eval", unit="scn")
+        ]
 
     records: list = []
     for r in per_scenario:
