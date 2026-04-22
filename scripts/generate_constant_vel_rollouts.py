@@ -288,15 +288,36 @@ def main(cfg: DictConfig) -> None:
         cfg.model.model_config.get("rollout_save_precision", "fp16")
     )
 
+    # `trainer.limit_test_batches` is a Lightning knob and has no effect when
+    # we iterate the dataloader directly. Honor it here so sweep drivers that
+    # pass the same override work for both model runs and this baseline.
+    limit_test_batches = OmegaConf.select(
+        cfg, "trainer.limit_test_batches", default=None,
+    )
+    max_batches = None
+    if limit_test_batches is not None:
+        try:
+            lt = float(limit_test_batches)
+            if 0 < lt < 1:
+                # Fractional form: fraction of the total dataloader length.
+                max_batches = max(1, int(lt * len(dataloader)))
+            elif lt >= 1:
+                max_batches = int(lt)
+        except (TypeError, ValueError):
+            max_batches = None
+
     print(
         f"[constant_vel] dataset={dataset_version} "
         f"maps={list(cfg.data.test_map_names) if cfg.data.test_map_names else 'all'} "
         f"n_rollouts={n_rollouts} "
         f"noise_vel_sigma={noise_vel_sigma} noise_head_sigma={noise_head_sigma} "
+        f"limit_test_batches={max_batches if max_batches is not None else 'none'} "
         f"save_dir={save_dir}"
     )
 
-    for data in tqdm(dataloader, desc="generate", unit="batch"):
+    for batch_idx, data in enumerate(tqdm(dataloader, desc="generate", unit="batch")):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         pred_traj_all, pred_head_all = _build_rollout(
             data, n_rollouts, noise_vel_sigma, noise_head_sigma, noise_generator,
         )
