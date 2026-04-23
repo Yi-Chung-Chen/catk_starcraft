@@ -139,7 +139,7 @@ if [ "$NGPUS" -gt 1 ]; then
     ckpt_path=$MY_CKPT_PATH \
     model.model_config.val_closed_loop=true \
     model.model_config.val_open_loop=false \
-    model.model_config.n_rollout_closed_val=16 \
+    model.model_config.n_rollout_closed_val=32 \
     model.model_config.n_vis_batch=0 \
     model.model_config.n_vis_scenario=2 \
     task_name=$MY_TASK_NAME \
@@ -159,7 +159,7 @@ else
     ckpt_path=$MY_CKPT_PATH \
     model.model_config.val_closed_loop=true \
     model.model_config.val_open_loop=false \
-    model.model_config.n_rollout_closed_val=16 \
+    model.model_config.n_rollout_closed_val=32 \
     model.model_config.n_vis_batch=0 \
     model.model_config.n_vis_scenario=2 \
     task_name=$MY_TASK_NAME \

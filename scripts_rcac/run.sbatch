@@ -9,7 +9,8 @@
 #SBATCH --output=logs/slurm/%j.out
 #SBATCH --error=logs/slurm/%j.err
 
-# Usage: sbatch scripts_rcac/run.sbatch train_sc.sh [variant] [dataset]
+# Usage: sbatch scripts_rcac/run.sbatch <script.sh> [args...]
+# Example: sbatch scripts_rcac/run.sbatch local_test_sc.sh <ckpt> [variant] [dataset] [maps] [save_rollouts]
 
 SCRIPT=${1:?Usage: sbatch scripts_rcac/run.sbatch <script.sh> [args...]}
 shift
