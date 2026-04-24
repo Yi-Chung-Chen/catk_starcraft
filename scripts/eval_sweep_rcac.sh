@@ -71,7 +71,7 @@ run_eval() {
   # Usage: run_eval <run_dir>
   local run_dir="$1"
   local rollouts_dir="$run_dir/rollouts"
-  if [ ! -d "$rollouts_dir" ] || [ -z "$(ls -A "$rollouts_dir"/*.h5 2>/dev/null || true)" ]; then
+  if [ ! -d "$rollouts_dir" ] || ! find "$rollouts_dir" -maxdepth 1 -name '*.h5' -print -quit | grep -q .; then
     echo "!! no rollouts produced under $rollouts_dir — skipping eval" | tee -a "$run_dir/eval.log"
     return 0
   fi

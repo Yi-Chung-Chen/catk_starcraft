@@ -298,10 +298,11 @@ def main(cfg: DictConfig) -> None:
     if limit_test_batches is not None:
         try:
             lt = float(limit_test_batches)
-            if 0 < lt < 1:
-                # Fractional form: fraction of the total dataloader length.
+            if 0 < lt <= 1:
+                # Match Lightning semantics: floats in (0, 1] mean a fraction
+                # of the dataloader, so 1.0 means the full split, not 1 batch.
                 max_batches = max(1, int(lt * len(dataloader)))
-            elif lt >= 1:
+            elif lt > 1:
                 max_batches = int(lt)
         except (TypeError, ValueError):
             max_batches = None
